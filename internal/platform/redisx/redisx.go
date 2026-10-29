@@ -26,6 +26,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -94,6 +95,7 @@ func New(cfg Config) (*redis.Client, error) {
 		}
 	}
 	c := redis.NewClient(opts)
+	c.AddHook(&breakerHook{cooldown: 5 * time.Second})
 	c.AddHook(tracingHook{})
 	return c, nil
 }
@@ -155,6 +157,65 @@ func BuildIAMToken(ctx context.Context, creds aws.CredentialsProvider, region, c
 		return "", fmt.Errorf("presign: %w", err)
 	}
 	return strings.TrimPrefix(signed, "http://"), nil
+}
+
+// ErrBreakerOpen is returned immediately while the circuit breaker is open.
+var ErrBreakerOpen = errors.New("redis circuit breaker open: cache recently unreachable")
+
+// breakerHook is a minimal circuit breaker. Problem it solves: callers treat the
+// cache as optional and "fail open", but if ElastiCache is unreachable (not
+// refusing - black-holed) EVERY request would still wait for the dial/read
+// timeout before falling back, turning a cache outage into a latency outage.
+// After a transport-level failure the breaker rejects all commands instantly
+// for `cooldown`, then lets the next command probe the cache again.
+// Errors that Redis itself returns (WRONGTYPE, NOSCRIPT, ...) do not open it.
+type breakerHook struct {
+	cooldown  time.Duration
+	mu        sync.Mutex
+	openUntil time.Time
+}
+
+func (b *breakerHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (b *breakerHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if b.isOpen() {
+			return ErrBreakerOpen
+		}
+		err := next(ctx, cmd)
+		b.record(err)
+		return err
+	}
+}
+
+func (b *breakerHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		if b.isOpen() {
+			return ErrBreakerOpen
+		}
+		err := next(ctx, cmds)
+		b.record(err)
+		return err
+	}
+}
+
+func (b *breakerHook) isOpen() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return time.Now().Before(b.openUntil)
+}
+
+func (b *breakerHook) record(err error) {
+	if err == nil || errors.Is(err, redis.Nil) || errors.Is(err, context.Canceled) {
+		return
+	}
+	var re redis.Error
+	if errors.As(err, &re) { // an error reply from a healthy server
+		return
+	}
+	b.mu.Lock()
+	b.openUntil = time.Now().Add(b.cooldown)
+	b.mu.Unlock()
 }
 
 // tracingHook creates one span per Redis command (go-redis v9 Hook interface).

@@ -1,0 +1,49 @@
+name: catalog-api
+service: catalog
+kind: http-api
+image_binary: catalog-api
+ports: {public: 8080, internal: null}
+base_path: /catalog
+probes: {live: /livez, ready: /readyz, version: /version}
+graceful_shutdown_seconds: 30
+config_change_requires_restart: true
+env:
+  - {name: AWS_REGION, required: true, secret: false, source: static, example: "us-east-1", description: "Region for every SDK client"}
+  - {name: AWS_MAX_ATTEMPTS, required: false, secret: false, source: static, example: "3", description: "SDK retry attempts (1-10), default 3"}
+  - {name: LOG_LEVEL, required: false, secret: false, source: static, example: "info", description: "debug|info|warn|error"}
+  - {name: HTTP_ADDR, required: false, secret: false, source: static, example: ":8080", description: "Public listener, default :8080"}
+  - {name: BASE_PATH, required: false, secret: false, source: static, example: "/catalog", description: "Public route prefix, default /catalog; the Ingress does not strip it"}
+  - {name: SHUTDOWN_DELAY, required: false, secret: false, source: static, example: "5s", description: "Wait after SIGTERM before draining, default 5s"}
+  - {name: OTEL_EXPORTER_OTLP_ENDPOINT, required: false, secret: false, source: static, example: "http://otel-collector.observability:4318", description: "OTLP/HTTP collector; telemetry is a no-op when unset"}
+  - {name: OTEL_SERVICE_NAME, required: false, secret: false, source: static, example: "catalog-api", description: "Service name in traces/metrics"}
+  - {name: OTEL_RESOURCE_ATTRIBUTES, required: false, secret: false, source: static, example: "deployment.environment=dev", description: "Extra resource attributes"}
+  - {name: COGNITO_ISSUER, required: true, secret: false, source: terraform-output, example: "https://cognito-idp.us-east-1.amazonaws.com/<user-pool-id>", description: "Expected iss claim; JWKS is fetched from <issuer>/.well-known/jwks.json"}
+  - {name: COGNITO_CLIENT_ID, required: true, secret: false, source: terraform-output, example: "<app-client-id>", description: "Expected client_id claim of access tokens"}
+  - {name: DB_HOST, required: true, secret: false, source: terraform-output, example: "<rds-endpoint>", description: "RDS PostgreSQL endpoint host name (must match the TLS certificate)"}
+  - {name: DB_PORT, required: false, secret: false, source: static, example: "5432", description: "Default 5432"}
+  - {name: DB_NAME, required: true, secret: false, source: static, example: "catalog", description: "Database name"}
+  - {name: DB_USER, required: true, secret: false, source: static, example: "catalog_app", description: "Database user created WITH rds_iam; the migrate Job uses catalog_migrator"}
+  - {name: DB_IAM_AUTH, required: true, secret: false, source: static, example: "true", description: "Must be true; the service has no password path"}
+  - {name: DB_MAX_CONNS, required: false, secret: false, source: static, example: "10", description: "pgxpool max connections, default 10. replicas x this must stay below the RDS max_connections"}
+  - {name: DB_STATEMENT_TIMEOUT, required: false, secret: false, source: static, example: "5s", description: "Server-side statement_timeout, default 5s"}
+  - {name: DB_SSL_ROOT_CERT, required: false, secret: false, source: static, example: "/etc/ssl/rds/global-bundle.pem", description: "Override the embedded RDS CA bundle (normally unset)"}
+  - {name: REDIS_ADDR, required: true, secret: false, source: terraform-output, example: "<elasticache-endpoint>:6379", description: "ElastiCache primary endpoint host:port (TLS)"}
+  - {name: REDIS_USER, required: false, secret: false, source: static, example: "catalog", description: "Redis ACL user (IAM-enabled user when REDIS_IAM_AUTH=true)"}
+  - {name: REDIS_IAM_AUTH, required: false, secret: false, source: static, example: "true", description: "Use an IAM token as the Redis password"}
+  - {name: CACHE_NAME, required: false, secret: false, source: terraform-output, example: "<cache-name>", description: "ElastiCache replication group / serverless cache name; required when REDIS_IAM_AUTH=true"}
+  - {name: REDIS_SERVERLESS, required: false, secret: false, source: static, example: "false", description: "true for ElastiCache Serverless (changes the IAM token request)"}
+  - {name: REDIS_AUTH_FILE, required: false, secret: true, source: mounted-secret, example: "/var/run/secrets/redis/password", description: "Fallback: file holding a Redis AUTH password (when IAM auth is off)"}
+  - {name: IMAGES_BUCKET, required: true, secret: false, source: terraform-output, example: "<images-bucket>", description: "S3 bucket receiving event images"}
+  - {name: CDN_BASE_URL, required: true, secret: false, source: terraform-output, example: "https://cdn.example.com", description: "CloudFront base URL serving the images bucket"}
+  - {name: EVENT_BUS_NAME, required: true, secret: false, source: terraform-output, example: "gatepass-dev", description: "EventBridge bus for EventPublished"}
+iam:
+  - {action: "rds-db:connect", resource: "arn:aws:rds-db:<region>:<account-id>:dbuser:<db-resource-id>/catalog_app", why: "Generate an IAM auth token used as the PostgreSQL password"}
+  - {action: "elasticache:Connect", resource: "arn:aws:elasticache:<region>:<account-id>:replicationgroup:<CACHE_NAME> (or :serverlesscache:) and arn:aws:elasticache:<region>:<account-id>:user:<REDIS_USER>", why: "Redis IAM authentication (only when REDIS_IAM_AUTH=true)"}
+  - {action: "s3:PutObject", resource: "arn:aws:s3:::<IMAGES_BUCKET>/images/events/*", why: "The role signs presigned PUT URLs; the URL only works if the signer may write that key"}
+  - {action: "events:PutEvents", resource: "arn:aws:events:<region>:<account-id>:event-bus/<EVENT_BUS_NAME>", why: "Publish EventPublished"}
+calls_out: [postgres (rds), elasticache, s3 (presign only, no network call), eventbridge, cognito-jwks (public HTTPS)]
+queues: {consumes: [], produces: []}
+events: {publishes: [EventPublished], consumes: []}
+database: {engine: postgres, auth: iam, migrate_command: "catalog-api migrate (run as DB_USER=catalog_migrator)"}
+scaling_hint: {cpu_request: 100m, memory_request: 128Mi, hpa_metric: cpu, keda_queue: null}
+metrics: [catalog_cache_hits_total, catalog_cache_misses_total, catalog_cache_errors_total, catalog_events_published_total, catalog_event_announce_failures_total, db_pool_connections_acquired, db_pool_connections_idle, db_pool_connections_total, db_pool_connections_max, http.server.request.duration]
