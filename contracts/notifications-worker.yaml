@@ -1,0 +1,48 @@
+name: notifications-worker
+service: notifications
+kind: worker
+image_binary: notifications-worker
+ports: {public: 8080, internal: null}     # probes only
+base_path: null
+probes: {live: /livez, ready: /readyz, version: /version}
+graceful_shutdown_seconds: 30
+config_change_requires_restart: true
+notes:
+  - "TICKET_SIGNING_KEY_FILE must point at a mounted secret (>= 32 chars). The same key verifies QR codes at the gate. Rotating it invalidates tickets already issued."
+  - "SES sandbox: set EMAIL_RECIPIENT_OVERRIDE to a verified address, or the SES mailbox simulator success@simulator.amazonses.com. Remove it once SES production access is granted."
+env:
+  - {name: AWS_REGION, required: true, secret: false, source: static, example: "us-east-1", description: "Region for every SDK client"}
+  - {name: AWS_MAX_ATTEMPTS, required: false, secret: false, source: static, example: "3", description: "SDK retry attempts (1-10), default 3"}
+  - {name: LOG_LEVEL, required: false, secret: false, source: static, example: "info", description: "debug|info|warn|error"}
+  - {name: HTTP_ADDR, required: false, secret: false, source: static, example: ":8080", description: "Probe listener, default :8080"}
+  - {name: SHUTDOWN_DELAY, required: false, secret: false, source: static, example: "5s", description: "Wait after SIGTERM before draining, default 5s"}
+  - {name: OTEL_EXPORTER_OTLP_ENDPOINT, required: false, secret: false, source: static, example: "http://otel-collector.observability:4318", description: "OTLP/HTTP collector; no-op when unset"}
+  - {name: OTEL_SERVICE_NAME, required: false, secret: false, source: static, example: "notifications-worker", description: "Service name in telemetry"}
+  - {name: OTEL_RESOURCE_ATTRIBUTES, required: false, secret: false, source: static, example: "deployment.environment=dev", description: "Extra resource attributes"}
+  - {name: TABLE_NAME, required: true, secret: false, source: terraform-output, example: "<notifications-table>", description: "DynamoDB table (PK, SK; TTL attribute ttl; no GSI)"}
+  - {name: TICKETS_BUCKET, required: true, secret: false, source: terraform-output, example: "<tickets-bucket>", description: "Private S3 bucket for tickets/<userId>/<orderId>.png"}
+  - {name: NOTIFICATIONS_QUEUE_URL, required: true, secret: false, source: terraform-output, example: "https://sqs.us-east-1.amazonaws.com/<account-id>/notifications", description: "Queue fed by EventBridge rules; DLQ with maxReceiveCount 5; visibility timeout >= 60s"}
+  - {name: COGNITO_USER_POOL_ID, required: true, secret: false, source: terraform-output, example: "<user-pool-id>", description: "Pool used for AdminGetUser (username = user id / sub)"}
+  - {name: SES_FROM_ADDRESS, required: true, secret: false, source: terraform-output, example: "tickets@example.com", description: "Verified SES sender identity"}
+  - {name: SES_CONFIGURATION_SET, required: false, secret: false, source: terraform-output, example: "gatepass", description: "SES configuration set (bounce/complaint events)"}
+  - {name: EMAIL_RECIPIENT_OVERRIDE, required: false, secret: false, source: static, example: "success@simulator.amazonses.com", description: "Send EVERY e-mail to this one address (sandbox helper)"}
+  - {name: TICKET_SIGNING_KEY_FILE, required: true, secret: true, source: mounted-secret, example: "/var/run/secrets/ticket/signing-key", description: "File with the HMAC key for QR tokens (>= 32 chars)"}
+  - {name: TICKET_LINK_TTL, required: false, secret: false, source: static, example: "24h", description: "Requested validity of the e-mailed link, 1m-168h, default 24h (effective validity is capped by the signing credentials' lifetime)"}
+  - {name: WORKER_CONCURRENCY, required: false, secret: false, source: static, example: "4", description: "Concurrent messages per pod, 1-64, default 4"}
+  - {name: CONSUMER_VISIBILITY_TIMEOUT, required: false, secret: false, source: static, example: "60s", description: "Visibility timeout set per receive (extended by a heartbeat), default 60s"}
+iam:
+  - {action: "sqs:ReceiveMessage", resource: "arn:aws:sqs:<region>:<account-id>:notifications", why: "Long-poll the queue"}
+  - {action: "sqs:DeleteMessage", resource: "arn:aws:sqs:<region>:<account-id>:notifications", why: "Acknowledge after processing"}
+  - {action: "sqs:ChangeMessageVisibility", resource: "arn:aws:sqs:<region>:<account-id>:notifications", why: "Heartbeat extension"}
+  - {action: "dynamodb:GetItem", resource: "arn:aws:dynamodb:<region>:<account-id>:table/<TABLE_NAME>", why: "Preferences, processed-event marker"}
+  - {action: "dynamodb:PutItem", resource: "arn:aws:dynamodb:<region>:<account-id>:table/<TABLE_NAME>", why: "Notification log, ticket record, processed-event marker"}
+  - {action: "s3:PutObject", resource: "arn:aws:s3:::<TICKETS_BUCKET>/tickets/*", why: "Store the rendered ticket"}
+  - {action: "s3:GetObject", resource: "arn:aws:s3:::<TICKETS_BUCKET>/tickets/*", why: "Needed so the presigned GET link it creates works"}
+  - {action: "cognito-idp:AdminGetUser", resource: "arn:aws:cognito-idp:<region>:<account-id>:userpool/<COGNITO_USER_POOL_ID>", why: "Look up the buyer's e-mail address at send time"}
+  - {action: "ses:SendEmail", resource: "arn:aws:ses:<region>:<account-id>:identity/<SES_FROM_ADDRESS or its domain> and arn:aws:ses:<region>:<account-id>:configuration-set/<SES_CONFIGURATION_SET>", why: "Send the e-mail (SES v2 SendEmail)"}
+calls_out: [sqs, dynamodb, s3, cognito-idp, ses]
+queues: {consumes: [notifications], produces: []}
+events: {publishes: [], consumes: [OrderPaid, PaymentFailed, OrderCancelled]}
+database: {engine: dynamodb, auth: iam, migrate_command: null}
+scaling_hint: {cpu_request: 100m, memory_request: 128Mi, hpa_metric: null, keda_queue: notifications}
+metrics: [notifications_sent_total, notifications_failed_total, ticket_render_duration_seconds, ses_throttled_total, sqs_messages_received_total, sqs_messages_failed_total]

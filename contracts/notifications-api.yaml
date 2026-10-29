@@ -1,0 +1,34 @@
+name: notifications-api
+service: notifications
+kind: http-api
+image_binary: notifications-api
+ports: {public: 8080, internal: null}
+base_path: /notifications
+probes: {live: /livez, ready: /readyz, version: /version}
+graceful_shutdown_seconds: 30
+config_change_requires_restart: true
+env:
+  - {name: AWS_REGION, required: true, secret: false, source: static, example: "us-east-1", description: "Region for every SDK client"}
+  - {name: AWS_MAX_ATTEMPTS, required: false, secret: false, source: static, example: "3", description: "SDK retry attempts (1-10), default 3"}
+  - {name: LOG_LEVEL, required: false, secret: false, source: static, example: "info", description: "debug|info|warn|error"}
+  - {name: HTTP_ADDR, required: false, secret: false, source: static, example: ":8080", description: "Public listener, default :8080"}
+  - {name: BASE_PATH, required: false, secret: false, source: static, example: "/notifications", description: "Public route prefix, default /notifications; the Ingress does not strip it"}
+  - {name: SHUTDOWN_DELAY, required: false, secret: false, source: static, example: "5s", description: "Wait after SIGTERM before draining, default 5s"}
+  - {name: OTEL_EXPORTER_OTLP_ENDPOINT, required: false, secret: false, source: static, example: "http://otel-collector.observability:4318", description: "OTLP/HTTP collector; no-op when unset"}
+  - {name: OTEL_SERVICE_NAME, required: false, secret: false, source: static, example: "notifications-api", description: "Service name in telemetry"}
+  - {name: OTEL_RESOURCE_ATTRIBUTES, required: false, secret: false, source: static, example: "deployment.environment=dev", description: "Extra resource attributes"}
+  - {name: TABLE_NAME, required: true, secret: false, source: terraform-output, example: "<notifications-table>", description: "DynamoDB table (PK, SK; TTL attribute ttl; no GSI)"}
+  - {name: TICKETS_BUCKET, required: true, secret: false, source: terraform-output, example: "<tickets-bucket>", description: "Private S3 bucket for tickets/<userId>/<orderId>.png"}
+  - {name: COGNITO_ISSUER, required: true, secret: false, source: terraform-output, example: "https://cognito-idp.us-east-1.amazonaws.com/<user-pool-id>", description: "Expected iss claim"}
+  - {name: COGNITO_CLIENT_ID, required: true, secret: false, source: terraform-output, example: "<app-client-id>", description: "Expected client_id claim of access tokens"}
+iam:
+  - {action: "dynamodb:GetItem", resource: "arn:aws:dynamodb:<region>:<account-id>:table/<TABLE_NAME>", why: "Preferences, ticket records (consistent reads); readiness probe"}
+  - {action: "dynamodb:PutItem", resource: "arn:aws:dynamodb:<region>:<account-id>:table/<TABLE_NAME>", why: "Save preferences"}
+  - {action: "dynamodb:Query", resource: "arn:aws:dynamodb:<region>:<account-id>:table/<TABLE_NAME>", why: "List the caller's notifications"}
+  - {action: "s3:GetObject", resource: "arn:aws:s3:::<TICKETS_BUCKET>/tickets/*", why: "The role signs presigned GET URLs; a URL signed by a role without GetObject returns 403"}
+calls_out: [dynamodb, s3 (presign only, no network call), cognito-jwks (public HTTPS)]
+queues: {consumes: [], produces: []}
+events: {publishes: [], consumes: []}
+database: {engine: dynamodb, auth: iam, migrate_command: null}
+scaling_hint: {cpu_request: 50m, memory_request: 64Mi, hpa_metric: cpu, keda_queue: null}
+metrics: [http.server.request.duration]

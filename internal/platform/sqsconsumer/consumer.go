@@ -39,6 +39,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 
+	"github.com/olagookundavid/gatepass-app/internal/platform/logging"
 	"github.com/olagookundavid/gatepass-app/internal/platform/telemetry"
 )
 
@@ -177,6 +178,9 @@ func (c *Consumer) process(parent context.Context, raw types.Message) {
 	if n, err := strconv.Atoi(raw.Attributes[string(types.MessageSystemAttributeNameApproximateReceiveCount)]); err == nil {
 		msg.ReceiveCount = n
 	}
+	// Give log lines a request_id (the SQS message id) and a settable user_id, the
+	// same correlation fields HTTP requests have.
+	ctx, _ = logging.WithReqInfo(ctx, msg.ID)
 	// Continue the producer's trace.
 	ctx = telemetry.ContextWithTraceparent(ctx, msg.Attributes["traceparent"])
 	ctx, span := telemetry.Tracer().Start(ctx, "sqs.process "+c.cfg.Name)

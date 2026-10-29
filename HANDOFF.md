@@ -14,8 +14,8 @@ Written incrementally while building; read this first. Placeholders (`<account-i
 | `orders-api` (+ `migrate`) | done | unit tests; integration against local Postgres |
 | `orders-worker` | done | unit tests; poison/DLQ integration test written, needs real SQS |
 | `orders-outbox-relay` | done | two-relay exactly-once verified against local Postgres |
-| `notifications-api` | missing | |
-| `notifications-worker` | missing | |
+| `notifications-api` | done | unit tests; store integration verified on DynamoDB Local |
+| `notifications-worker` | done | unit tests; end-to-end test written, needs real SQS/S3/SES |
 | `lambda-nightly-report` | missing | |
 
 ### Commands run (latest result)
@@ -29,6 +29,8 @@ Checks run after every step: `go build ./...`, `go vet ./...`, `go vet -tags int
 - After reservations (+ hold-expirer): `go build ./...`, `go vet ./...`, `go vet -tags integration ./...`, `golangci-lint run`, `go test ./...` all pass. `go test -tags integration ./internal/reservations/integration/` was run against **DynamoDB Local** (`amazon/dynamodb-local` container, `AWS_ENDPOINT_URL_DYNAMODB`, dummy credentials) and a local redis:7: 50 concurrent holds vs 10 tickets -> exactly 10, idempotent create/consume, expiry released once through both Lambda shapes, consumer idempotency, GSI pagination, Lua rate limiter all PASS. Only `TestScheduleCreatedAndDeleted` was skipped (needs real EventBridge Scheduler). DynamoDB Local does not reproduce real-DynamoDB contention (`TransactionConflict`); that path is covered by a unit test with a scripted client.
 
 - After orders (3 binaries): all five checks pass, `docker build --build-arg BINARY=orders-api --platform linux/amd64` succeeds. `go test -tags integration ./internal/orders/integration/` was run (3 times) against a **local postgres:17 container**: idempotency (replay does not re-consume, different body -> 409, 20 concurrent duplicates -> one order), rollback leaves no rows, two relays publish 300 rows exactly once each (`FOR UPDATE SKIP LOCKED`), cancel-vs-payment races end in a legal state with matching history/outbox, the payment reconciler, and secret rotation (reconnect after one auth failure, using an in-memory fake of the Secrets Manager port) all PASS. Skipped (need AWS): `TestPoisonMessageReachesDLQAfterMaxReceives`, `TestSecretRotationAgainstRealSecretsManager`. The orders bootstrap SQL below was verified locally (app can DML but not DDL, report user is read-only).
+
+- After notifications (2 binaries): all five checks pass; `docker build --build-arg BINARY=notifications-worker --platform linux/amd64` succeeds. `TestStoreNotificationLogPreferencesTicketsAndDedupe` was run against **DynamoDB Local** and passes (log pagination newest-first without empty pages, preferences, owner-only ticket records, dedupe marker). Skipped (need AWS): presigned URL download/expiry, worker end-to-end with SES simulator, real Cognito lookup. The ticket PNG was rendered and inspected by eye.
 
 <!-- END-S1 -->
 
@@ -57,6 +59,9 @@ Per-binary lists are in `contracts/<binary>.yaml` (name, required, secret, sourc
 - **orders-api** (`migrate` uses `AWS_REGION, DB_HOST, DB_PORT, DB_NAME, DB_SECRET_ID` with the migrator's secret): `DB_HOST*, DB_PORT, DB_NAME*, DB_SECRET_ID*, DB_MAX_CONNS, DB_STATEMENT_TIMEOUT, DB_SSL_ROOT_CERT, RESERVATIONS_INTERNAL_URL*, PAYMENTS_QUEUE_URL*, COGNITO_ISSUER*, COGNITO_CLIENT_ID*`.
 - **orders-worker**: DB vars as above, `PAYMENTS_QUEUE_URL*, WORKER_CONCURRENCY, CONSUMER_VISIBILITY_TIMEOUT, PAYMENT_SUCCESS_RATE`.
 - **orders-outbox-relay**: DB vars as above, `EVENT_BUS_NAME*, PAYMENTS_QUEUE_URL*, OUTBOX_BATCH_SIZE, OUTBOX_POLL_INTERVAL, PAYMENT_RECONCILE_AFTER, OUTBOX_RETENTION`.
+
+- **notifications-api**: `TABLE_NAME*, TICKETS_BUCKET*, COGNITO_ISSUER*, COGNITO_CLIENT_ID*`.
+- **notifications-worker**: `TABLE_NAME*, TICKETS_BUCKET*, NOTIFICATIONS_QUEUE_URL*, COGNITO_USER_POOL_ID*, SES_FROM_ADDRESS*, TICKET_SIGNING_KEY_FILE*` (a mounted secret file), `SES_CONFIGURATION_SET, EMAIL_RECIPIENT_OVERRIDE, TICKET_LINK_TTL, WORKER_CONCURRENCY, CONSUMER_VISIBILITY_TIMEOUT`.
 
 <!-- END-S2 -->
 
@@ -129,6 +134,20 @@ Network (not IAM): HTTP to the reservations **internal** Service (port 8081), RD
 
 `rds-db:connect` on `.../dbuser:<db-resource-id>/orders_report`, `s3:PutObject` on `reports/*`.
 
+### notifications-api
+
+`dynamodb:GetItem`, `dynamodb:PutItem`, `dynamodb:Query` on the notifications table ARN; `s3:GetObject` on `arn:aws:s3:::<tickets-bucket>/tickets/*` (the signing role must itself be allowed to read what it presigns).
+
+### notifications-worker
+
+| Action | Resource | Why |
+|---|---|---|
+| `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:ChangeMessageVisibility` | notifications queue ARN | consumer |
+| `dynamodb:GetItem`, `dynamodb:PutItem` | notifications table ARN | preferences, log, ticket record, dedupe marker |
+| `s3:PutObject`, `s3:GetObject` | `arn:aws:s3:::<tickets-bucket>/tickets/*` | store the ticket; make the presigned link work |
+| `cognito-idp:AdminGetUser` | `arn:aws:cognito-idp:<region>:<account-id>:userpool/<pool-id>` | look up the address at send time |
+| `ses:SendEmail` | the identity ARN (`arn:aws:ses:<region>:<account-id>:identity/<address-or-domain>`) and the configuration set ARN | send mail (SES v2) |
+
 <!-- END-S3 -->
 
 ## 4. AWS resources the code expects
@@ -189,6 +208,15 @@ ALTER DEFAULT PRIVILEGES FOR ROLE orders_migrator IN SCHEMA public
 - **EventBridge** bus: same as catalog. Source used by orders: `gatepass.orders`.
 - Recommended alarms: DLQ not empty; `outbox_unpublished` > 0 for 5 min; `orders_payment_enqueue_failures_total` rate; relay pod count < 1.
 
+### notifications
+
+- **DynamoDB table** (own table, `TABLE_NAME`), on-demand. Keys `PK` (S) hash, `SK` (S) range, **no GSI**, **TTL attribute `ttl`** (used only by `EVT#` markers). Item layout: `USER#<id>/NOTIF#<time>#<id>`, `USER#<id>/PREFS`, `USER#<id>/TICKET#<orderId>`, `EVT#<eventId>/EVT`.
+- **S3 tickets bucket** (`TICKETS_BUCKET`): private, block public access, default encryption; keys `tickets/<userId>/<orderId>.png`; add a lifecycle expiry rule.
+- **SQS `notifications`** + DLQ (`maxReceiveCount` 5, visibility timeout >= 60 s), queue policy allowing `events.amazonaws.com` from the three rules.
+- **SES**: a verified identity for `SES_FROM_ADDRESS` (domain identity with DKIM is the production choice), optionally a configuration set. The account is in the **SES sandbox** until production access is granted: set `EMAIL_RECIPIENT_OVERRIDE` to a verified address (or `success@simulator.amazonses.com`).
+- **Cognito user pool** (`COGNITO_USER_POOL_ID`): users must have an `email` attribute. The worker role needs `AdminGetUser`.
+- **Secret for the QR signing key**: a random string of at least 32 characters (for example `openssl rand -base64 48`), delivered to the pod as a file (`TICKET_SIGNING_KEY_FILE`), never in Git or env.
+
 <!-- END-S4 -->
 
 ## 5. Event rules
@@ -206,6 +234,16 @@ Three rules on bus `gatepass-<env>`, all with the inventory queue as target (SQS
 | inventory-order-cancelled | `{"source":["gatepass.orders"],"detail-type":["OrderCancelled"]}` |
 
 - Published by orders (source `gatepass.orders`, via the outbox relay): `OrderPlaced`, `OrderPaid`, `PaymentFailed`, `OrderCancelled`. Consumer rules: reservations (PaymentFailed, OrderCancelled, see above); notifications rules are listed in the notifications section. Optionally an archive of the whole bus for `OrderPlaced` audit.
+
+Three more rules on the same bus, target = the notifications queue (SQS target, no input transformer):
+
+| Rule | Event pattern |
+|---|---|
+| notifications-order-paid | `{"source":["gatepass.orders"],"detail-type":["OrderPaid"]}` |
+| notifications-payment-failed | `{"source":["gatepass.orders"],"detail-type":["PaymentFailed"]}` |
+| notifications-order-cancelled | `{"source":["gatepass.orders"],"detail-type":["OrderCancelled"]}` |
+
+Summary of all rules: catalog `EventPublished` -> inventory queue; orders `PaymentFailed`, `OrderCancelled` -> inventory queue AND notifications queue; orders `OrderPaid` -> notifications queue; `OrderPlaced` has no consumer (archive only).
 
 <!-- END-S5 -->
 
@@ -250,6 +288,15 @@ Three rules on bus `gatepass-<env>`, all with the inventory queue as target (SQS
 - orders: outbox published rows are deleted after `OUTBOX_RETENTION` (default 7 days) by the relay; this needs DELETE on `outbox`/`idempotency_keys` for `orders_app` (granted by the default privileges above).
 - orders: cancel body is optional (`{"reason": "..."}`), default reason `cancelled by user`; only the owner may cancel (admins can read, not cancel).
 
+- notifications: the ticket pointer is stored as an extra item `USER#<id>/TICKET#<orderId>` so ownership needs no scan; "ownership via the notification log" is therefore a record in the same partition and the same table.
+- notifications: preferences are checked before the Cognito lookup; the ticket is still generated when e-mail is disabled (so `ticket-url` works).
+- notifications: marker-after-work means a crash between SES send and marker can produce a duplicate e-mail (at-least-once). Accepted and documented in code.
+- notifications: **a presigned URL cannot outlive the credentials that signed it.** With IRSA/Pod Identity (about 1 h session credentials) the "valid 24 h" e-mailed link may expire earlier. The fresh-link endpoint always works. For durable links use CloudFront signed URLs or signing with a long-lived principal (not allowed here).
+- notifications: ticket PNG text uses a built-in 3x5 pixel font because no text-rendering library is on the approved list; only `go-qrcode` is added for the QR matrix.
+- notifications: a PaymentFailed/OrderCancelled e-mail never contains a link. A cancelled paid order keeps its ticket object (no revoke); gate verification should also check the order status.
+- notifications: `userId` and `orderId` from events must match `[A-Za-z0-9_-]{1,128}` (they become S3 keys); otherwise the message errors into the DLQ.
+- sqsconsumer: every message now gets a log correlation context (`request_id` = SQS message id) so `user_id` can be attached by handlers.
+
 <!-- END-S6 -->
 
 ## 7. UNVERIFIED items
@@ -269,6 +316,10 @@ Three rules on bus `gatepass-<env>`, all with the inventory queue as target (SQS
 - orders: EventBridge `PutEvents` from the relay with the real bus; entry size limits (events are small).
 - orders: the `Transition` row lock and `clock_timestamp()` ordering under the production RDS parameter group (verified on postgres:17 only).
 
+- notifications: `AdminGetUser` with the `sub` as `Username` for the real user pool (`TestRealCognitoLookup`); SES v2 `SendEmail` permissions/ARNs for identity and configuration set, sandbox behaviour, `MessageRejected` classification of real rejections; worker end to end (`TestWorkerEndToEndAndDuplicateMessageSendsOneEmail`).
+- notifications: presigned GET behaviour when signed with role credentials (effective expiry) and the download/expiry test (`TestPresignedURLDownloadsThenExpires`); S3 `ResponseContentDisposition` override accepted on presigned GET.
+- notifications: whether `cognito-idp:AdminGetUser` is throttled at the worker's concurrency (default quota is low); raise `WORKER_CONCURRENCY` carefully.
+
 <!-- END-S7 -->
 
 ## 8. Dependencies beyond the approved list
@@ -276,6 +327,8 @@ Three rules on bus `gatepass-<env>`, all with the inventory queue as target (SQS
 - None so far. Transitive: `golang.org/x/*`, grpc/protobuf (pulled in by the OTLP exporters). `otelaws` is approved but upstream marks it deprecated (kept, `//nolint:staticcheck` in `internal/platform/awscfg`).
 
 - `github.com/aws/aws-lambda-go` (events + runtime): within "lambda events" in the approved list. `service/scheduler`, `service/dynamodb` are on the list. No DynamoDB `attributevalue` helper is used (items are marshalled by hand).
+
+- `github.com/skip2/go-qrcode`: approved list (QR in the ticket PNG). `service/sesv2`, `service/cognitoidentityprovider`, `service/s3` are on the list. No unapproved module was added. (golang.org/x/image was considered for text and rejected in favour of a tiny built-in font.)
 
 <!-- END-S8 -->
 
