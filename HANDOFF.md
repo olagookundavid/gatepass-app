@@ -4,64 +4,279 @@ Written incrementally while building; read this first. Placeholders (`<account-i
 
 ## 1. Status
 
-| Binary | Status | Notes |
+Everything the prompt asked for is built; nothing was cut. AWS behaviour is **unverified** (no AWS calls were made, by design): see section 7.
+
+| Binary | Status | Verified how |
 |---|---|---|
-| `internal/platform/*` | done | unit tested |
-| `build/Dockerfile` | done | amd64 and arm64 build verified for the skeleton `catalog-api` |
-| `catalog-api` (+ `migrate`) | done | unit + local-container integration verified, see section 1 commands |
-| `reservations-api` | done | public + internal HTTP, inventory SQS consumer (`CONSUMER_ENABLED`), unit tests, integration tests run against DynamoDB Local + Redis |
-| `lambda-hold-expirer` | done | both payload shapes; handler unit-tested and exercised against DynamoDB Local |
-| `orders-api` (+ `migrate`) | done | unit tests; integration against local Postgres |
-| `orders-worker` | done | unit tests; poison/DLQ integration test written, needs real SQS |
-| `orders-outbox-relay` | done | two-relay exactly-once verified against local Postgres |
-| `notifications-api` | done | unit tests; store integration verified on DynamoDB Local |
-| `notifications-worker` | done | unit tests; end-to-end test written, needs real SQS/S3/SES |
-| `lambda-nightly-report` | missing | |
+| `internal/platform/*` | done | unit tests |
+| `build/Dockerfile` | done | image builds for linux/amd64 and linux/arm64 (arm64 image ran read-only) |
+| `catalog-api` (+ `migrate`) | done | unit tests; repositories and cache run against local PostgreSQL 17 and Redis 7 |
+| `reservations-api` | done | unit tests; DynamoDB transactions run against DynamoDB Local and Redis 7 |
+| `lambda-hold-expirer` | done | handler unit tests (both payload shapes); run against DynamoDB Local |
+| `orders-api` (+ `migrate`) | done | unit tests; transactions, idempotency, rotation run against local PostgreSQL 17 |
+| `orders-worker` | done | unit tests; DLQ integration test written (needs real SQS) |
+| `orders-outbox-relay` | done | unit tests; two relays publish each row exactly once on local PostgreSQL 17 |
+| `notifications-api` | done | unit tests; store verified on DynamoDB Local |
+| `notifications-worker` | done | unit tests; end-to-end test written (needs real SQS/S3/SES) |
+| `lambda-nightly-report` | done | unit tests; report query and window edge cases on local PostgreSQL 17 |
 
-### Commands run (latest result)
+### Commands run and results (final state)
 
-Checks run after every step: `go build ./...`, `go vet ./...`, `go vet -tags integration ./...`, `golangci-lint run`, `go test ./...`.
+| Command | Result |
+|---|---|
+| `gofmt -l .` | no output |
+| `go build ./...` | ok |
+| `go vet ./...` | ok |
+| `go vet -tags integration ./...` | ok (integration tests compile) |
+| `golangci-lint run` (v2.1.6, config in `.golangci.yml`, includes the `integration` tag) | `0 issues.` |
+| `go test -count=1 ./...` | 37 packages ok, 123 tests pass, 0 fail |
+| `go test -tags integration -count=1 ./...` with no AWS variables | all packages ok; every integration test skips and names the variables it needs |
+| `make build` | builds all 9 binaries |
+| `make lint` | go vet (both tag sets) + golangci-lint: 0 issues |
+| `make lambda-zip` | `dist/lambda-hold-expirer.zip`, `dist/lambda-nightly-report.zip` (linux/arm64 `bootstrap`, statically linked) |
+| `docker build -f build/Dockerfile --build-arg BINARY=<b> --platform linux/amd64 .` | succeeded for `catalog-api`, `reservations-api`, `orders-api`, `notifications-worker` (amd64) and `reservations-api` (arm64; the earlier `catalog-api` skeleton also on both). Images are 10-44 MB, run as `nonroot`. `reservations-api` started with no environment exits with a message listing all 8 missing variables |
+| `ruby` script over `api/*.yaml` and `contracts/*.yaml` | all parse; 4 OpenAPI 3.1 files and 9 contracts, operationIds unique (no spectral installed) |
+| `bash -n scripts/golden-path.sh` and a run against a throwaway mock server | syntax ok; walkthrough completes and never prints a token |
 
-- After platform: all five pass (0 lint issues). `docker build -f build/Dockerfile --build-arg BINARY=catalog-api --platform linux/amd64` and `linux/arm64` succeed; the arm64 image ran with `--read-only` and answered `/livez` and `/version`.
+### Integration tests run against throwaway local services
 
-- After catalog: `go build ./...`, `go vet ./...`, `go vet -tags integration ./...`, `golangci-lint run`, `go test ./...` all pass. Catalog integration tests `TestPostgresRepositories` and `TestCacheAsideAgainstRealRedisAndOutageFallback` were run against **throwaway local containers** (postgres:17 and redis:7, started with `docker run`, nothing committed) and pass; this verified the SQL (keyset pagination, optimistic locking, migrations, bootstrap grants) and cache-aside/outage fallback. The AWS-dependent catalog integration tests (RDS IAM auth, S3 presign, PutEvents to SQS) compile but were not run.
+These were run by hand with containers started only for the checks (nothing for this is committed; no compose files):
 
-- After reservations (+ hold-expirer): `go build ./...`, `go vet ./...`, `go vet -tags integration ./...`, `golangci-lint run`, `go test ./...` all pass. `go test -tags integration ./internal/reservations/integration/` was run against **DynamoDB Local** (`amazon/dynamodb-local` container, `AWS_ENDPOINT_URL_DYNAMODB`, dummy credentials) and a local redis:7: 50 concurrent holds vs 10 tickets -> exactly 10, idempotent create/consume, expiry released once through both Lambda shapes, consumer idempotency, GSI pagination, Lua rate limiter all PASS. Only `TestScheduleCreatedAndDeleted` was skipped (needs real EventBridge Scheduler). DynamoDB Local does not reproduce real-DynamoDB contention (`TransactionConflict`); that path is covered by a unit test with a scripted client.
+| Tests | Against | Result |
+|---|---|---|
+| catalog: `TestPostgresRepositories`, `TestCacheAsideAgainstRealRedisAndOutageFallback` | postgres:17, redis:7 | pass |
+| reservations: 8 of 9 tests in `internal/reservations/integration` (50 concurrent holds vs 10 tickets -> exactly 10; idempotent create/consume; expiry through both Lambda shapes; consumer idempotency; GSI pagination; Lua rate limiter) | `amazon/dynamodb-local` via `AWS_ENDPOINT_URL_DYNAMODB`, redis:7 | pass (`TestScheduleCreatedAndDeleted` skipped: needs Scheduler) |
+| orders: idempotency, rollback, two relays exactly once, cancel-vs-payment race, reconciler, secret rotation with a fake secret source | postgres:17 | pass (3 consecutive runs) |
+| notifications: `TestStoreNotificationLogPreferencesTicketsAndDedupe` | DynamoDB Local | pass |
+| reports: `TestReportQueryWindowAndCSV` | postgres:17 | pass |
+| bootstrap SQL of catalog and orders (roles, default privileges, read-only user) | postgres:17 | verified: app user can DML but not DDL; report user cannot write |
 
-- After orders (3 binaries): all five checks pass, `docker build --build-arg BINARY=orders-api --platform linux/amd64` succeeds. `go test -tags integration ./internal/orders/integration/` was run (3 times) against a **local postgres:17 container**: idempotency (replay does not re-consume, different body -> 409, 20 concurrent duplicates -> one order), rollback leaves no rows, two relays publish 300 rows exactly once each (`FOR UPDATE SKIP LOCKED`), cancel-vs-payment races end in a legal state with matching history/outbox, the payment reconciler, and secret rotation (reconnect after one auth failure, using an in-memory fake of the Secrets Manager port) all PASS. Skipped (need AWS): `TestPoisonMessageReachesDLQAfterMaxReceives`, `TestSecretRotationAgainstRealSecretsManager`. The orders bootstrap SQL below was verified locally (app can DML but not DDL, report user is read-only).
-
-- After notifications (2 binaries): all five checks pass; `docker build --build-arg BINARY=notifications-worker --platform linux/amd64` succeeds. `TestStoreNotificationLogPreferencesTicketsAndDedupe` was run against **DynamoDB Local** and passes (log pagination newest-first without empty pages, preferences, owner-only ticket records, dedupe marker). Skipped (need AWS): presigned URL download/expiry, worker end-to-end with SES simulator, real Cognito lookup. The ticket PNG was rendered and inspected by eye.
+Not run (need real AWS): RDS IAM auth, ElastiCache IAM auth and TLS, S3 presigned URL behaviour, EventBridge/SQS delivery, Scheduler, SES, Cognito, real Secrets Manager rotation, DynamoDB TransactionConflict behaviour under real contention.
 
 <!-- END-S1 -->
 
 ## 2. Environment variables per binary
 
-(Filled per service below. Variables shared by all binaries.)
+Shared by every binary (also in each contract):
 
 | Variable | Required | Meaning |
 |---|---|---|
 | `AWS_REGION` | yes | region for every SDK client |
 | `AWS_MAX_ATTEMPTS` | no | SDK retry attempts, 1..10, default 3 |
 | `LOG_LEVEL` | no | debug/info/warn/error, default info |
-| `HTTP_ADDR` | no | public listener, default `:8080` |
-| `BASE_PATH` | no | public route prefix (per service default) |
+| `HTTP_ADDR` | no | public (or probe) listener, default `:8080` |
+| `BASE_PATH` | no | public route prefix (service default: `/catalog`, `/reservations`, `/orders`, `/notifications`) |
 | `SHUTDOWN_DELAY` | no | wait after SIGTERM before draining, default 5s |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES` | no | telemetry; no-op when the endpoint is unset |
-| `COGNITO_ISSUER`, `COGNITO_CLIENT_ID` | yes (public APIs) | JWT validation |
+| `COGNITO_ISSUER`, `COGNITO_CLIENT_ID` | public APIs | JWT validation |
 
-Per-binary lists are in `contracts/<binary>.yaml` (name, required, secret, source, example, description) and in `services/<service>/README.md`. The final handoff regenerates the complete tables from the contracts. Shared variables above, plus:
+Complete per-binary tables, generated from `contracts/*.yaml` (the contracts are the source of truth; the same tables are in each `services/*/README.md`, and `services/*/<binary>.env.example` holds placeholder env files). "Source" in the contracts says where the coach gets the value: `terraform-output`, `static`, `mounted-secret`, `lambda-runtime`.
 
-- **catalog-api** (`migrate` subcommand uses only `AWS_REGION, DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_IAM_AUTH`): `DB_HOST*, DB_PORT, DB_NAME*, DB_USER*, DB_IAM_AUTH*(=true), DB_MAX_CONNS, DB_STATEMENT_TIMEOUT, DB_SSL_ROOT_CERT, REDIS_ADDR*, REDIS_USER, REDIS_IAM_AUTH, CACHE_NAME, REDIS_SERVERLESS, REDIS_AUTH_FILE, IMAGES_BUCKET*, CDN_BASE_URL*, EVENT_BUS_NAME*` (`*` = required).
+#### `catalog-api`
 
-- **reservations-api** (`*` required; the second group is required only when `API_ENABLED=true`): `TABLE_NAME*, API_ENABLED, CONSUMER_ENABLED, INVENTORY_QUEUE_URL (if CONSUMER_ENABLED), CONSUMER_WORKERS, CONSUMER_VISIBILITY_TIMEOUT, INTERNAL_HTTP_ADDR, HOLD_TTL, RATE_LIMIT_PER_MINUTE`; API mode: `COGNITO_ISSUER, COGNITO_CLIENT_ID, SCHEDULER_GROUP_NAME, SCHEDULER_ROLE_ARN, EXPIRER_LAMBDA_ARN, REDIS_ADDR, REDIS_USER, REDIS_IAM_AUTH, CACHE_NAME, REDIS_SERVERLESS, REDIS_AUTH_FILE`.
-- **lambda-hold-expirer**: `TABLE_NAME*`, `AWS_REGION` (runtime), `LOG_LEVEL`.
+| Variable | Required | Secret | Example | Description |
+|---|---|---|---|---|
+| `AWS_REGION` | yes | no | `us-east-1` | Region for every SDK client |
+| `AWS_MAX_ATTEMPTS` | no | no | `3` | SDK retry attempts (1-10), default 3 |
+| `LOG_LEVEL` | no | no | `info` | debug/info/warn/error |
+| `HTTP_ADDR` | no | no | `:8080` | Public listener, default :8080 |
+| `BASE_PATH` | no | no | `/catalog` | Public route prefix, default /catalog; the Ingress does not strip it |
+| `SHUTDOWN_DELAY` | no | no | `5s` | Wait after SIGTERM before draining, default 5s |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | no | no | `http://otel-collector.observability:4318` | OTLP/HTTP collector; telemetry is a no-op when unset |
+| `OTEL_SERVICE_NAME` | no | no | `catalog-api` | Service name in traces/metrics |
+| `OTEL_RESOURCE_ATTRIBUTES` | no | no | `deployment.environment=dev` | Extra resource attributes |
+| `COGNITO_ISSUER` | yes | no | `https://cognito-idp.us-east-1.amazonaws.com/<user-pool-id>` | Expected iss claim; JWKS is fetched from <issuer>/.well-known/jwks.json |
+| `COGNITO_CLIENT_ID` | yes | no | `<app-client-id>` | Expected client_id claim of access tokens |
+| `DB_HOST` | yes | no | `<rds-endpoint>` | RDS PostgreSQL endpoint host name (must match the TLS certificate) |
+| `DB_PORT` | no | no | `5432` | Default 5432 |
+| `DB_NAME` | yes | no | `catalog` | Database name |
+| `DB_USER` | yes | no | `catalog_app` | Database user created WITH rds_iam; the migrate Job uses catalog_migrator |
+| `DB_IAM_AUTH` | yes | no | `true` | Must be true; the service has no password path |
+| `DB_MAX_CONNS` | no | no | `10` | pgxpool max connections, default 10. replicas x this must stay below the RDS max_connections |
+| `DB_STATEMENT_TIMEOUT` | no | no | `5s` | Server-side statement_timeout, default 5s |
+| `DB_SSL_ROOT_CERT` | no | no | `/etc/ssl/rds/global-bundle.pem` | Override the embedded RDS CA bundle (normally unset) |
+| `REDIS_ADDR` | yes | no | `<elasticache-endpoint>:6379` | ElastiCache primary endpoint host:port (TLS) |
+| `REDIS_USER` | no | no | `catalog` | Redis ACL user (IAM-enabled user when REDIS_IAM_AUTH=true) |
+| `REDIS_IAM_AUTH` | no | no | `true` | Use an IAM token as the Redis password |
+| `CACHE_NAME` | no | no | `<cache-name>` | ElastiCache replication group / serverless cache name; required when REDIS_IAM_AUTH=true |
+| `REDIS_SERVERLESS` | no | no | `false` | true for ElastiCache Serverless (changes the IAM token request) |
+| `REDIS_AUTH_FILE` | no | yes | `/var/run/secrets/redis/password` | Fallback: file holding a Redis AUTH password (when IAM auth is off) |
+| `IMAGES_BUCKET` | yes | no | `<images-bucket>` | S3 bucket receiving event images |
+| `CDN_BASE_URL` | yes | no | `https://cdn.example.com` | CloudFront base URL serving the images bucket |
+| `EVENT_BUS_NAME` | yes | no | `gatepass-dev` | EventBridge bus for EventPublished |
 
-- **orders-api** (`migrate` uses `AWS_REGION, DB_HOST, DB_PORT, DB_NAME, DB_SECRET_ID` with the migrator's secret): `DB_HOST*, DB_PORT, DB_NAME*, DB_SECRET_ID*, DB_MAX_CONNS, DB_STATEMENT_TIMEOUT, DB_SSL_ROOT_CERT, RESERVATIONS_INTERNAL_URL*, PAYMENTS_QUEUE_URL*, COGNITO_ISSUER*, COGNITO_CLIENT_ID*`.
-- **orders-worker**: DB vars as above, `PAYMENTS_QUEUE_URL*, WORKER_CONCURRENCY, CONSUMER_VISIBILITY_TIMEOUT, PAYMENT_SUCCESS_RATE`.
-- **orders-outbox-relay**: DB vars as above, `EVENT_BUS_NAME*, PAYMENTS_QUEUE_URL*, OUTBOX_BATCH_SIZE, OUTBOX_POLL_INTERVAL, PAYMENT_RECONCILE_AFTER, OUTBOX_RETENTION`.
+#### `lambda-hold-expirer`
 
-- **notifications-api**: `TABLE_NAME*, TICKETS_BUCKET*, COGNITO_ISSUER*, COGNITO_CLIENT_ID*`.
-- **notifications-worker**: `TABLE_NAME*, TICKETS_BUCKET*, NOTIFICATIONS_QUEUE_URL*, COGNITO_USER_POOL_ID*, SES_FROM_ADDRESS*, TICKET_SIGNING_KEY_FILE*` (a mounted secret file), `SES_CONFIGURATION_SET, EMAIL_RECIPIENT_OVERRIDE, TICKET_LINK_TTL, WORKER_CONCURRENCY, CONSUMER_VISIBILITY_TIMEOUT`.
+| Variable | Required | Secret | Example | Description |
+|---|---|---|---|---|
+| `TABLE_NAME` | yes | no | `<reservations-table>` | Same DynamoDB table as reservations-api |
+| `AWS_REGION` | yes | no | `us-east-1` | Set by the Lambda runtime |
+| `LOG_LEVEL` | no | no | `info` | debug/info/warn/error |
+| `AWS_MAX_ATTEMPTS` | no | no | `3` | SDK retry attempts |
+
+#### `lambda-nightly-report`
+
+| Variable | Required | Secret | Example | Description |
+|---|---|---|---|---|
+| `DB_HOST` | yes | no | `<rds-endpoint>` | RDS endpoint host name of the orders database (must match the TLS certificate) |
+| `DB_PORT` | no | no | `5432` | Default 5432 |
+| `DB_NAME` | yes | no | `orders` | Orders database name |
+| `DB_USER` | yes | no | `orders_report` | Read-only database user created WITH rds_iam |
+| `REPORTS_BUCKET` | yes | no | `<reports-bucket>` | S3 bucket for reports/YYYY/MM/DD.csv |
+| `AWS_REGION` | yes | no | `us-east-1` | Set by the Lambda runtime |
+| `LOG_LEVEL` | no | no | `info` | debug/info/warn/error |
+
+#### `notifications-api`
+
+| Variable | Required | Secret | Example | Description |
+|---|---|---|---|---|
+| `AWS_REGION` | yes | no | `us-east-1` | Region for every SDK client |
+| `AWS_MAX_ATTEMPTS` | no | no | `3` | SDK retry attempts (1-10), default 3 |
+| `LOG_LEVEL` | no | no | `info` | debug/info/warn/error |
+| `HTTP_ADDR` | no | no | `:8080` | Public listener, default :8080 |
+| `BASE_PATH` | no | no | `/notifications` | Public route prefix, default /notifications; the Ingress does not strip it |
+| `SHUTDOWN_DELAY` | no | no | `5s` | Wait after SIGTERM before draining, default 5s |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | no | no | `http://otel-collector.observability:4318` | OTLP/HTTP collector; no-op when unset |
+| `OTEL_SERVICE_NAME` | no | no | `notifications-api` | Service name in telemetry |
+| `OTEL_RESOURCE_ATTRIBUTES` | no | no | `deployment.environment=dev` | Extra resource attributes |
+| `TABLE_NAME` | yes | no | `<notifications-table>` | DynamoDB table (PK, SK; TTL attribute ttl; no GSI) |
+| `TICKETS_BUCKET` | yes | no | `<tickets-bucket>` | Private S3 bucket for tickets/<userId>/<orderId>.png |
+| `COGNITO_ISSUER` | yes | no | `https://cognito-idp.us-east-1.amazonaws.com/<user-pool-id>` | Expected iss claim |
+| `COGNITO_CLIENT_ID` | yes | no | `<app-client-id>` | Expected client_id claim of access tokens |
+
+#### `notifications-worker`
+
+| Variable | Required | Secret | Example | Description |
+|---|---|---|---|---|
+| `AWS_REGION` | yes | no | `us-east-1` | Region for every SDK client |
+| `AWS_MAX_ATTEMPTS` | no | no | `3` | SDK retry attempts (1-10), default 3 |
+| `LOG_LEVEL` | no | no | `info` | debug/info/warn/error |
+| `HTTP_ADDR` | no | no | `:8080` | Probe listener, default :8080 |
+| `SHUTDOWN_DELAY` | no | no | `5s` | Wait after SIGTERM before draining, default 5s |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | no | no | `http://otel-collector.observability:4318` | OTLP/HTTP collector; no-op when unset |
+| `OTEL_SERVICE_NAME` | no | no | `notifications-worker` | Service name in telemetry |
+| `OTEL_RESOURCE_ATTRIBUTES` | no | no | `deployment.environment=dev` | Extra resource attributes |
+| `TABLE_NAME` | yes | no | `<notifications-table>` | DynamoDB table (PK, SK; TTL attribute ttl; no GSI) |
+| `TICKETS_BUCKET` | yes | no | `<tickets-bucket>` | Private S3 bucket for tickets/<userId>/<orderId>.png |
+| `NOTIFICATIONS_QUEUE_URL` | yes | no | `https://sqs.us-east-1.amazonaws.com/<account-id>/notifications` | Queue fed by EventBridge rules; DLQ with maxReceiveCount 5; visibility timeout >= 60s |
+| `COGNITO_USER_POOL_ID` | yes | no | `<user-pool-id>` | Pool used for AdminGetUser (username = user id / sub) |
+| `SES_FROM_ADDRESS` | yes | no | `tickets@example.com` | Verified SES sender identity |
+| `SES_CONFIGURATION_SET` | no | no | `gatepass` | SES configuration set (bounce/complaint events) |
+| `EMAIL_RECIPIENT_OVERRIDE` | no | no | `success@simulator.amazonses.com` | Send EVERY e-mail to this one address (sandbox helper) |
+| `TICKET_SIGNING_KEY_FILE` | yes | yes | `/var/run/secrets/ticket/signing-key` | File with the HMAC key for QR tokens (>= 32 chars) |
+| `TICKET_LINK_TTL` | no | no | `24h` | Requested validity of the e-mailed link, 1m-168h, default 24h (effective validity is capped by the signing credentials' lifetime) |
+| `WORKER_CONCURRENCY` | no | no | `4` | Concurrent messages per pod, 1-64, default 4 |
+| `CONSUMER_VISIBILITY_TIMEOUT` | no | no | `60s` | Visibility timeout set per receive (extended by a heartbeat), default 60s |
+
+#### `orders-api`
+
+| Variable | Required | Secret | Example | Description |
+|---|---|---|---|---|
+| `AWS_REGION` | yes | no | `us-east-1` | Region for every SDK client |
+| `AWS_MAX_ATTEMPTS` | no | no | `3` | SDK retry attempts (1-10), default 3 |
+| `LOG_LEVEL` | no | no | `info` | debug/info/warn/error |
+| `HTTP_ADDR` | no | no | `:8080` | Public listener, default :8080 |
+| `BASE_PATH` | no | no | `/orders` | Public route prefix, default /orders; the Ingress does not strip it |
+| `SHUTDOWN_DELAY` | no | no | `5s` | Wait after SIGTERM before draining, default 5s |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | no | no | `http://otel-collector.observability:4318` | OTLP/HTTP collector; no-op when unset |
+| `OTEL_SERVICE_NAME` | no | no | `orders-api` | Service name in telemetry |
+| `OTEL_RESOURCE_ATTRIBUTES` | no | no | `deployment.environment=dev` | Extra resource attributes |
+| `COGNITO_ISSUER` | yes | no | `https://cognito-idp.us-east-1.amazonaws.com/<user-pool-id>` | Expected iss claim |
+| `COGNITO_CLIENT_ID` | yes | no | `<app-client-id>` | Expected client_id claim of access tokens |
+| `DB_HOST` | yes | no | `<rds-endpoint>` | RDS PostgreSQL endpoint host name (must match the TLS certificate) |
+| `DB_PORT` | no | no | `5432` | Default 5432 |
+| `DB_NAME` | yes | no | `orders` | Database name |
+| `DB_SECRET_ID` | yes | no | `<secret-name-or-arn>` | Secrets Manager secret holding JSON {username,password} (orders_app; the migrate Job uses the orders_migrator secret). The VALUE is never in Git or env |
+| `DB_MAX_CONNS` | no | no | `10` | pgxpool max connections, default 10 |
+| `DB_STATEMENT_TIMEOUT` | no | no | `5s` | Server-side statement_timeout, default 5s |
+| `DB_SSL_ROOT_CERT` | no | no | `/etc/ssl/rds/global-bundle.pem` | Override the embedded RDS CA bundle (normally unset) |
+| `RESERVATIONS_INTERNAL_URL` | yes | no | `http://reservations-internal.gatepass.svc.cluster.local:8081` | Cluster-internal URL of the reservations INTERNAL listener (no trailing path) |
+| `PAYMENTS_QUEUE_URL` | yes | no | `https://sqs.us-east-1.amazonaws.com/<account-id>/orders-payments` | Payments queue (with DLQ, maxReceiveCount 5) |
+
+#### `orders-outbox-relay`
+
+| Variable | Required | Secret | Example | Description |
+|---|---|---|---|---|
+| `AWS_REGION` | yes | no | `us-east-1` | Region for every SDK client |
+| `AWS_MAX_ATTEMPTS` | no | no | `3` | SDK retry attempts (1-10), default 3 |
+| `LOG_LEVEL` | no | no | `info` | debug/info/warn/error |
+| `HTTP_ADDR` | no | no | `:8080` | Probe listener, default :8080 |
+| `SHUTDOWN_DELAY` | no | no | `5s` | Wait after SIGTERM before draining, default 5s |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | no | no | `http://otel-collector.observability:4318` | OTLP/HTTP collector; no-op when unset |
+| `OTEL_SERVICE_NAME` | no | no | `orders-outbox-relay` | Service name in telemetry |
+| `OTEL_RESOURCE_ATTRIBUTES` | no | no | `deployment.environment=dev` | Extra resource attributes |
+| `DB_HOST` | yes | no | `<rds-endpoint>` | RDS PostgreSQL endpoint host name (must match the TLS certificate) |
+| `DB_PORT` | no | no | `5432` | Default 5432 |
+| `DB_NAME` | yes | no | `orders` | Database name |
+| `DB_SECRET_ID` | yes | no | `<secret-name-or-arn>` | Secrets Manager secret holding JSON {username,password} (orders_app; the migrate Job uses the orders_migrator secret). The VALUE is never in Git or env |
+| `DB_MAX_CONNS` | no | no | `10` | pgxpool max connections, default 10 |
+| `DB_STATEMENT_TIMEOUT` | no | no | `5s` | Server-side statement_timeout, default 5s |
+| `DB_SSL_ROOT_CERT` | no | no | `/etc/ssl/rds/global-bundle.pem` | Override the embedded RDS CA bundle (normally unset) |
+| `EVENT_BUS_NAME` | yes | no | `gatepass-dev` | EventBridge bus |
+| `PAYMENTS_QUEUE_URL` | yes | no | `https://sqs.us-east-1.amazonaws.com/<account-id>/orders-payments` | Used only by the payment reconciler |
+| `OUTBOX_BATCH_SIZE` | no | no | `25` | Rows per cycle, 1-100, default 25 |
+| `OUTBOX_POLL_INTERVAL` | no | no | `1s` | Idle sleep between cycles (min 100ms), default 1s |
+| `PAYMENT_RECONCILE_AFTER` | no | no | `30s` | Grace period before an unqueued payment is reconciled, default 30s |
+| `OUTBOX_RETENTION` | no | no | `168h` | How long published outbox rows are kept, default 168h (7 days) |
+
+#### `orders-worker`
+
+| Variable | Required | Secret | Example | Description |
+|---|---|---|---|---|
+| `AWS_REGION` | yes | no | `us-east-1` | Region for every SDK client |
+| `AWS_MAX_ATTEMPTS` | no | no | `3` | SDK retry attempts (1-10), default 3 |
+| `LOG_LEVEL` | no | no | `info` | debug/info/warn/error |
+| `HTTP_ADDR` | no | no | `:8080` | Probe listener, default :8080 |
+| `SHUTDOWN_DELAY` | no | no | `5s` | Wait after SIGTERM before draining, default 5s |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | no | no | `http://otel-collector.observability:4318` | OTLP/HTTP collector; no-op when unset |
+| `OTEL_SERVICE_NAME` | no | no | `orders-worker` | Service name in telemetry |
+| `OTEL_RESOURCE_ATTRIBUTES` | no | no | `deployment.environment=dev` | Extra resource attributes |
+| `DB_HOST` | yes | no | `<rds-endpoint>` | RDS PostgreSQL endpoint host name (must match the TLS certificate) |
+| `DB_PORT` | no | no | `5432` | Default 5432 |
+| `DB_NAME` | yes | no | `orders` | Database name |
+| `DB_SECRET_ID` | yes | no | `<secret-name-or-arn>` | Secrets Manager secret holding JSON {username,password} (orders_app; the migrate Job uses the orders_migrator secret). The VALUE is never in Git or env |
+| `DB_MAX_CONNS` | no | no | `10` | pgxpool max connections, default 10 |
+| `DB_STATEMENT_TIMEOUT` | no | no | `5s` | Server-side statement_timeout, default 5s |
+| `DB_SSL_ROOT_CERT` | no | no | `/etc/ssl/rds/global-bundle.pem` | Override the embedded RDS CA bundle (normally unset) |
+| `PAYMENTS_QUEUE_URL` | yes | no | `https://sqs.us-east-1.amazonaws.com/<account-id>/orders-payments` | Queue to consume. Redrive policy to the DLQ: maxReceiveCount 5; queue visibility timeout >= 60s |
+| `WORKER_CONCURRENCY` | no | no | `4` | Concurrent payments per pod, 1-64, default 4 |
+| `CONSUMER_VISIBILITY_TIMEOUT` | no | no | `60s` | Visibility timeout set per receive (extended by a heartbeat), default 60s |
+| `PAYMENT_SUCCESS_RATE` | no | no | `0.8` | Probability a simulated payment is approved (0-1), default 0.8; the rest splits evenly into declines and transient errors |
+
+#### `reservations-api`
+
+| Variable | Required | Secret | Example | Description |
+|---|---|---|---|---|
+| `AWS_REGION` | yes | no | `us-east-1` | Region for every SDK client |
+| `AWS_MAX_ATTEMPTS` | no | no | `3` | SDK retry attempts (1-10), default 3 |
+| `LOG_LEVEL` | no | no | `info` | debug/info/warn/error |
+| `HTTP_ADDR` | no | no | `:8080` | Public listener, default :8080 |
+| `INTERNAL_HTTP_ADDR` | no | no | `:8081` | Internal listener (consume endpoint), default :8081; only started when API_ENABLED=true |
+| `BASE_PATH` | no | no | `/reservations` | Public route prefix, default /reservations |
+| `SHUTDOWN_DELAY` | no | no | `5s` | Wait after SIGTERM before draining, default 5s |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | no | no | `http://otel-collector.observability:4318` | OTLP/HTTP collector; no-op when unset |
+| `OTEL_SERVICE_NAME` | no | no | `reservations-api` | Service name in telemetry |
+| `OTEL_RESOURCE_ATTRIBUTES` | no | no | `deployment.environment=dev` | Extra resource attributes |
+| `TABLE_NAME` | yes | no | `<reservations-table>` | DynamoDB table (PK, SK, GSI1 on GSI1PK/GSI1SK, TTL attribute ttl) |
+| `API_ENABLED` | no | no | `true` | Serve the public and internal APIs, default true |
+| `CONSUMER_ENABLED` | no | no | `false` | Run the inventory SQS consumer, default false |
+| `INVENTORY_QUEUE_URL` | no | no | `https://sqs.us-east-1.amazonaws.com/<account-id>/reservations-inventory` | Required when CONSUMER_ENABLED=true |
+| `CONSUMER_WORKERS` | no | no | `4` | Concurrent message handlers, default 4 |
+| `CONSUMER_VISIBILITY_TIMEOUT` | no | no | `60s` | SQS visibility timeout set while handling (extended by a heartbeat), default 60s |
+| `COGNITO_ISSUER` | no | no | `https://cognito-idp.us-east-1.amazonaws.com/<user-pool-id>` | Required when API_ENABLED=true |
+| `COGNITO_CLIENT_ID` | no | no | `<app-client-id>` | Required when API_ENABLED=true |
+| `SCHEDULER_GROUP_NAME` | no | no | `gatepass-holds` | EventBridge Scheduler group holding hold-<id> schedules; required when API_ENABLED=true |
+| `SCHEDULER_ROLE_ARN` | no | no | `arn:aws:iam::<account-id>:role/gatepass-scheduler-invoke-expirer` | Role Scheduler assumes to invoke the Lambda; reservations-api needs iam:PassRole on it; required when API_ENABLED=true |
+| `EXPIRER_LAMBDA_ARN` | no | no | `arn:aws:lambda:us-east-1:<account-id>:function:gatepass-hold-expirer` | Schedule target; required when API_ENABLED=true |
+| `HOLD_TTL` | no | no | `10m` | How long a hold lasts, 1m-1h, default 10m |
+| `RATE_LIMIT_PER_MINUTE` | no | no | `10` | POST /holds per user per minute, default 10 |
+| `REDIS_ADDR` | no | no | `<elasticache-endpoint>:6379` | ElastiCache host:port (TLS); required when API_ENABLED=true |
+| `REDIS_USER` | no | no | `reservations` | Redis ACL user |
+| `REDIS_IAM_AUTH` | no | no | `true` | Use an IAM token as the Redis password |
+| `CACHE_NAME` | no | no | `<cache-name>` | ElastiCache name for the IAM token; required when REDIS_IAM_AUTH=true |
+| `REDIS_SERVERLESS` | no | no | `false` | true for ElastiCache Serverless |
+| `REDIS_AUTH_FILE` | no | yes | `/var/run/secrets/redis/password` | Fallback AUTH password file |
+
 
 <!-- END-S2 -->
 
@@ -130,9 +345,15 @@ Network (not IAM): HTTP to the reservations **internal** Service (port 8081), RD
 
 `secretsmanager:GetSecretValue` on the `orders_migrator` secret only.
 
-### nightly report Lambda (see its section when present)
+### lambda-nightly-report (execution role)
 
-`rds-db:connect` on `.../dbuser:<db-resource-id>/orders_report`, `s3:PutObject` on `reports/*`.
+| Action | Resource | Why |
+|---|---|---|
+| `rds-db:connect` | `arn:aws:rds-db:<region>:<account-id>:dbuser:<db-resource-id>/orders_report` | IAM database authentication as the read-only user |
+| `s3:PutObject` | `arn:aws:s3:::<reports-bucket>/reports/*` | write (overwrite) the daily CSV |
+| managed `AWSLambdaVPCAccessExecutionRole` | | the function runs in the VPC (ENI actions + logs) |
+
+The Scheduler execution role for the daily schedule needs `lambda:InvokeFunction` on this function.
 
 ### notifications-api
 
@@ -217,6 +438,15 @@ ALTER DEFAULT PRIVILEGES FOR ROLE orders_migrator IN SCHEMA public
 - **Cognito user pool** (`COGNITO_USER_POOL_ID`): users must have an `email` attribute. The worker role needs `AdminGetUser`.
 - **Secret for the QR signing key**: a random string of at least 32 characters (for example `openssl rand -base64 48`), delivered to the pod as a file (`TICKET_SIGNING_KEY_FILE`), never in Git or env.
 
+### reports (lambda-nightly-report)
+
+- **Lambda** `nightly-report`: `provided.al2023`, arm64, handler `bootstrap`, memory 256 MB, timeout 60 s, reserved concurrency 1, **inside the VPC** (private subnets that can reach RDS; its security group must be allowed by the RDS security group on 5432). Env: `DB_HOST, DB_NAME, DB_USER=orders_report, REPORTS_BUCKET` (+ optional `DB_PORT`).
+- **Network path to S3**: an S3 gateway VPC endpoint (free) or a NAT gateway, otherwise PutObject times out.
+- **S3 reports bucket** (`REPORTS_BUCKET`): private, versioning recommended, keys `reports/YYYY/MM/DD.csv`.
+- **EventBridge Scheduler schedule** (daily): `cron(5 0 * * ? *)` (UTC), input `{}`, flexible window off, its own invoke role (`lambda:InvokeFunction`), a small retry policy (the function is idempotent). Backfill: invoke with `{"date":"YYYY-MM-DD"}`.
+- **DB user** `orders_report` (IAM, SELECT only): created by the orders bootstrap SQL above; migration `0002_status_history_at_index.sql` adds the index the report query uses.
+- Alarms: Lambda `Errors`; absence of `reports/<yesterday>.csv` by 01:00 UTC.
+
 <!-- END-S4 -->
 
 ## 5. Event rules
@@ -297,6 +527,15 @@ Summary of all rules: catalog `EventPublished` -> inventory queue; orders `Payme
 - notifications: `userId` and `orderId` from events must match `[A-Za-z0-9_-]{1,128}` (they become S3 keys); otherwise the message errors into the DLQ.
 - sqsconsumer: every message now gets a log correlation context (`request_id` = SQS message id) so `user_id` can be attached by handlers.
 
+- platform: problem `type` values are URNs; `X-Request-Id` is only reused when it matches `[A-Za-z0-9._-]{8,64}` (otherwise a new UUID), so arbitrary client text never reaches logs or response headers.
+- platform: `BASE_PATH` prefixes only the public API; health routes are always at the root. The internal listener has no health routes (probes use the public port).
+- platform: readiness results are cached 5 s and failures are reported as `"fail"` without error text (hostnames could leak).
+- platform: `pgdb` has test-only constructors (`ConnectDSN`, `ConnectDSNWithCreds`) behind the `integration` build tag; no production binary contains them. The same tag guards `testenv.FreshSchema`.
+- reports: "sales of a day" = orders whose transition to `paid` happened in the UTC day (from `order_status_history`), with a column showing how many are still paid; a report for today is refused (`{"date":...}` must be a finished day).
+- A `.dockerignore` excludes docs, markdown and `.git` from the build context. `services/<service>/<binary>.env.example` files are generated from the contracts and contain placeholders only.
+- Git: local commits only, author = the machine's `git config` (user.name/user.email); no remote, no push, no trailers or AI attribution in messages.
+- The golden-path script needs `curl` and `jq`, reads `TOKEN`/`ADMIN_TOKEN` from the environment and never prints them. `WAIT_EXPIRY=true` additionally waits for a hold to expire.
+
 <!-- END-S6 -->
 
 ## 7. UNVERIFIED items
@@ -320,15 +559,28 @@ Summary of all rules: catalog `EventPublished` -> inventory queue; orders `Payme
 - notifications: presigned GET behaviour when signed with role credentials (effective expiry) and the download/expiry test (`TestPresignedURLDownloadsThenExpires`); S3 `ResponseContentDisposition` override accepted on presigned GET.
 - notifications: whether `cognito-idp:AdminGetUser` is throttled at the worker's concurrency (default quota is low); raise `WORKER_CONCURRENCY` carefully.
 
+- reports: RDS IAM authentication for the read-only user from a VPC Lambda (token generation is local; the TLS handshake against the embedded CA bundle is only verified offline), S3 reachability from the VPC, `PutObject` overwrite (`TestS3OverwritesTheSameKey`, `TestReadOnlyUserOverRDSIAMAuth`).
+- platform, all binaries: OTLP/HTTP export to a real collector; `otelaws` middleware (deprecated upstream) still produces spans; JWKS fetch from the real Cognito pool (unit tested with a local JWKS server only); `COGNITO_ISSUER` must equal the `iss` claim exactly (no trailing slash).
+- platform: Docker images were built and started on the build host only; nothing was run on EKS (read-only root filesystem with `/tmp` writable is assumed; the code does not write to disk except what the AWS SDK may cache under `/tmp` when configured).
+- OpenAPI files were hand-written for OpenAPI 3.1 and parse as YAML with unique operationIds, but were not validated by a linter or compared with the real responses by a tool.
+- Rate-limit/consumer/relay behaviour at scale (many pods, throttling) is reasoned about in comments but not load-tested.
+
 <!-- END-S7 -->
 
 ## 8. Dependencies beyond the approved list
 
-- None so far. Transitive: `golang.org/x/*`, grpc/protobuf (pulled in by the OTLP exporters). `otelaws` is approved but upstream marks it deprecated (kept, `//nolint:staticcheck` in `internal/platform/awscfg`).
+Final answer: **none**. Everything in `go.mod` is on the approved list or is a transitive dependency of it (`golang.org/x/*`, grpc/protobuf from the OTLP exporters, `smithy-go`, `go-retry` from goose, the AWS SDK internal modules). Direct requirements, with the reason:
 
-- `github.com/aws/aws-lambda-go` (events + runtime): within "lambda events" in the approved list. `service/scheduler`, `service/dynamodb` are on the list. No DynamoDB `attributevalue` helper is used (items are marshalled by hand).
-
-- `github.com/skip2/go-qrcode`: approved list (QR in the ticket PNG). `service/sesv2`, `service/cognitoidentityprovider`, `service/s3` are on the list. No unapproved module was added. (golang.org/x/image was considered for text and rejected in favour of a tiny built-in font.)
+| Module | Why |
+|---|---|
+| `aws-sdk-go-v2` + `config`, `feature/rds/auth`, `service/{dynamodb,eventbridge,s3,scheduler,secretsmanager,sesv2,sqs,cognitoidentityprovider}` | AWS access (default credential chain only) |
+| `aws-lambda-go` | Lambda runtime and event types (hold-expirer, nightly-report) |
+| `jackc/pgx/v5`, `redis/go-redis/v9` | PostgreSQL and Valkey/Redis |
+| `golang-jwt/jwt/v5` | Cognito token validation (JWKS cache is hand-written) |
+| `google/uuid` | UUIDv7 and deterministic v5 ids |
+| `pressly/goose/v3` | embedded migrations |
+| `skip2/go-qrcode` | QR matrix for the ticket |
+| `go.opentelemetry.io/otel/*`, `contrib/.../otelhttp`, `contrib/.../otelaws` | traces and metrics. `otelaws` is deprecated upstream (staticcheck SA1019, suppressed with a comment in `internal/platform/awscfg`); the supported replacement is the SDK's native smithy tracing |
 
 <!-- END-S8 -->
 
@@ -336,11 +588,41 @@ Summary of all rules: catalog `EventPublished` -> inventory queue; orders `Payme
 
 - OpenAPI validity is not machine-checked (spectral not installed).
 
+Known gaps (deliberate, not forgotten):
+
+- No refund flow: a payment approved after a cancellation is ignored and logged, nothing is refunded.
+- No ticket revocation: cancelling a paid order keeps the PNG in S3; a gate service should check the order status as well as the QR signature. There is no gate/scan service.
+- Presigned e-mail links are capped by the signing credentials' lifetime (see section 6). CloudFront signed URLs would fix it.
+- No admin endpoints to cancel an event or to list orders; no event cancellation flow (status `cancelled` exists but nothing sets it).
+- `GET /me/holds` and the notification log use eventually consistent / simple pagination; fine for UI lists.
+- Redis rate limiting is per user only (no per-IP), and the circuit breaker is a minimal one in `platform/redisx`.
+- The orders worker's payment simulator is random; there is no seed for reproducible runs (inject `Roll`/`Latency` in tests).
+- OpenAPI files are not generated from or checked against the code; the handlers are the truth.
+- Terraform/Helm/CI/GitOps are the coach's job; the contracts carry the facts (env, IAM, ports, queues, scaling hints).
+
+Suggestions for the coach, in the order that will bite first:
+
+1. Create DynamoDB tables with exactly the keys/GSI/TTL/streams of section 4 (reservations needs **GSI1** and **streams**; the TTL attribute is **`ttl`**).
+2. Remember `iam:PassRole` for reservations-api on the Scheduler role (section 3) and the Scheduler group; without them every `POST /holds` returns 503 after rolling the hold back.
+3. The internal listener of reservations must have its own ClusterIP Service and a NetworkPolicy; never route it through the Ingress.
+4. Run `catalog-api migrate` and `orders-api migrate` as PreSync Jobs with the migrator credentials; run the bootstrap SQL once first.
+5. Give the relay 2 replicas and alarm on `outbox_unpublished`; alarm on both DLQs.
+6. Start with `EMAIL_RECIPIENT_OVERRIDE` while SES is in the sandbox.
+7. First end-to-end check: `scripts/golden-path.sh`.
+
 <!-- END-S9 -->
 
 ## 10. How to read the code
 
 Start with `internal/platform/lifecycle`, `httpserver`, `auth`, `problem`, then `sqsconsumer`, `ebpub`, `pgdb`.
+
+1. `README.md` (repo level), then `services/<service>/README.md` for the service you are reading.
+2. Platform, in this order: `internal/platform/lifecycle` (graceful shutdown) -> `httpserver` (health, middleware) -> `problem` and `pagination` -> `auth` (JWT/JWKS) -> `config` -> `sqsconsumer` (at-least-once consumer) -> `ebpub` (EventBridge, partial failures) -> `pgdb` (TLS, IAM token, Secrets Manager, rotation) -> `redisx` (IAM token, circuit breaker) -> `telemetry`.
+3. `internal/catalog`: domain -> ports -> app (cache-aside, optimistic locking) -> adapters -> `cmd/catalog-api`.
+4. `internal/reservations`: domain (inventory math) -> app -> `adapters/dynamodb` (the transactions: the most important file in the repo) -> `scheduler` -> `lambda` -> `cmd/*`.
+5. `internal/orders`: domain (state machine, deterministic order id) -> app (`CreateOrder`, then `payments.go`, then `relay.go`) -> `adapters/postgres` -> `reservationsclient` -> `cmd/*`.
+6. `internal/notifications`: domain -> app (failure classification) -> adapters -> `cmd/*`; `internal/reports` last.
+7. For any service: read `integration/integration_test.go`; each test states a distributed-systems guarantee.
 
 <!-- END-S10 -->
 
