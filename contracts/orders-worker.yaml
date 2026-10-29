@@ -1,0 +1,41 @@
+name: orders-worker
+service: orders
+kind: worker
+image_binary: orders-worker
+ports: {public: 8080, internal: null}     # probes only, no business routes
+base_path: null
+probes: {live: /livez, ready: /readyz, version: /version}
+graceful_shutdown_seconds: 30             # in-flight payment (<= ~2 s) finishes; unfinished messages reappear after the visibility timeout
+config_change_requires_restart: true
+env:
+  - {name: AWS_REGION, required: true, secret: false, source: static, example: "us-east-1", description: "Region for every SDK client"}
+  - {name: AWS_MAX_ATTEMPTS, required: false, secret: false, source: static, example: "3", description: "SDK retry attempts (1-10), default 3"}
+  - {name: LOG_LEVEL, required: false, secret: false, source: static, example: "info", description: "debug|info|warn|error"}
+  - {name: HTTP_ADDR, required: false, secret: false, source: static, example: ":8080", description: "Probe listener, default :8080"}
+  - {name: SHUTDOWN_DELAY, required: false, secret: false, source: static, example: "5s", description: "Wait after SIGTERM before draining, default 5s"}
+  - {name: OTEL_EXPORTER_OTLP_ENDPOINT, required: false, secret: false, source: static, example: "http://otel-collector.observability:4318", description: "OTLP/HTTP collector; no-op when unset"}
+  - {name: OTEL_SERVICE_NAME, required: false, secret: false, source: static, example: "orders-worker", description: "Service name in telemetry"}
+  - {name: OTEL_RESOURCE_ATTRIBUTES, required: false, secret: false, source: static, example: "deployment.environment=dev", description: "Extra resource attributes"}
+  - {name: DB_HOST, required: true, secret: false, source: terraform-output, example: "<rds-endpoint>", description: "RDS PostgreSQL endpoint host name (must match the TLS certificate)"}
+  - {name: DB_PORT, required: false, secret: false, source: static, example: "5432", description: "Default 5432"}
+  - {name: DB_NAME, required: true, secret: false, source: static, example: "orders", description: "Database name"}
+  - {name: DB_SECRET_ID, required: true, secret: false, source: terraform-output, example: "<secret-name-or-arn>", description: "Secrets Manager secret holding JSON {username,password} (orders_app; the migrate Job uses the orders_migrator secret). The VALUE is never in Git or env"}
+  - {name: DB_MAX_CONNS, required: false, secret: false, source: static, example: "10", description: "pgxpool max connections, default 10"}
+  - {name: DB_STATEMENT_TIMEOUT, required: false, secret: false, source: static, example: "5s", description: "Server-side statement_timeout, default 5s"}
+  - {name: DB_SSL_ROOT_CERT, required: false, secret: false, source: static, example: "/etc/ssl/rds/global-bundle.pem", description: "Override the embedded RDS CA bundle (normally unset)"}
+  - {name: PAYMENTS_QUEUE_URL, required: true, secret: false, source: terraform-output, example: "https://sqs.us-east-1.amazonaws.com/<account-id>/orders-payments", description: "Queue to consume. Redrive policy to the DLQ: maxReceiveCount 5; queue visibility timeout >= 60s"}
+  - {name: WORKER_CONCURRENCY, required: false, secret: false, source: static, example: "4", description: "Concurrent payments per pod, 1-64, default 4"}
+  - {name: CONSUMER_VISIBILITY_TIMEOUT, required: false, secret: false, source: static, example: "60s", description: "Visibility timeout set per receive (extended by a heartbeat), default 60s"}
+  - {name: PAYMENT_SUCCESS_RATE, required: false, secret: false, source: static, example: "0.8", description: "Probability a simulated payment is approved (0-1), default 0.8; the rest splits evenly into declines and transient errors"}
+iam:
+  - {action: "secretsmanager:GetSecretValue", resource: "arn:aws:secretsmanager:<region>:<account-id>:secret:<DB_SECRET_ID>-*", why: "Read the database credentials; re-read after a rotation (auth failure)"}
+  - {action: "kms:Decrypt", resource: "the secret's KMS key (only if it is a customer-managed key)", why: "Decrypt the secret value"}
+  - {action: "sqs:ReceiveMessage", resource: "arn:aws:sqs:<region>:<account-id>:orders-payments", why: "Long-poll the payments queue"}
+  - {action: "sqs:DeleteMessage", resource: "arn:aws:sqs:<region>:<account-id>:orders-payments", why: "Acknowledge after the payment was processed"}
+  - {action: "sqs:ChangeMessageVisibility", resource: "arn:aws:sqs:<region>:<account-id>:orders-payments", why: "Heartbeat extension while a payment is processed"}
+calls_out: [postgres (rds), secrets-manager, sqs]
+queues: {consumes: [orders-payments], produces: []}
+events: {publishes: [], consumes: []}
+database: {engine: postgres, auth: secret, migrate_command: null}
+scaling_hint: {cpu_request: 100m, memory_request: 128Mi, hpa_metric: null, keda_queue: orders-payments}
+metrics: [orders_paid_total, payments_failed_total, payment_processing_duration_seconds, sqs_messages_received_total, sqs_messages_failed_total]

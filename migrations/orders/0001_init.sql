@@ -16,8 +16,13 @@ CREATE TABLE orders (
     status         text        NOT NULL CHECK (status IN ('pending_payment', 'paid', 'payment_failed', 'cancelled')),
     created_at     timestamptz NOT NULL DEFAULT now(),
     updated_at     timestamptz NOT NULL DEFAULT now(),
-    version        integer     NOT NULL DEFAULT 1
+    version        integer     NOT NULL DEFAULT 1,
+    -- Set when the payment request was put on the payments queue. NULL for
+    -- pending orders older than a short grace period means "the enqueue after
+    -- commit was lost": the outbox relay's reconciler sends it (see app/relay.go).
+    payment_enqueued_at timestamptz
 );
+CREATE INDEX orders_unenqueued_idx ON orders (created_at) WHERE status = 'pending_payment' AND payment_enqueued_at IS NULL;
 -- "my orders", newest first (keyset on (created_at, id) within a user).
 CREATE INDEX orders_user_created_idx ON orders (user_id, created_at DESC, id DESC);
 -- nightly report scans yesterday's orders.

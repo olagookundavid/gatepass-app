@@ -1,0 +1,46 @@
+name: orders-outbox-relay
+service: orders
+kind: relay
+image_binary: orders-outbox-relay
+ports: {public: 8080, internal: null}     # probes only
+base_path: null
+probes: {live: /livez, ready: /readyz, version: /version}
+graceful_shutdown_seconds: 30
+config_change_requires_restart: true
+notes:
+  - "Run 2 replicas. Rows are claimed with SELECT ... FOR UPDATE SKIP LOCKED, so replicas share the backlog and never publish the same row concurrently."
+  - "Also acts as the payment reconciler: pending orders whose payment request was never queued (API crash after commit) are queued after PAYMENT_RECONCILE_AFTER. Hence the sqs:SendMessage permission."
+  - "Alarm on the outbox_unpublished gauge staying > 0 for minutes (relay down, EventBridge failing)."
+env:
+  - {name: AWS_REGION, required: true, secret: false, source: static, example: "us-east-1", description: "Region for every SDK client"}
+  - {name: AWS_MAX_ATTEMPTS, required: false, secret: false, source: static, example: "3", description: "SDK retry attempts (1-10), default 3"}
+  - {name: LOG_LEVEL, required: false, secret: false, source: static, example: "info", description: "debug|info|warn|error"}
+  - {name: HTTP_ADDR, required: false, secret: false, source: static, example: ":8080", description: "Probe listener, default :8080"}
+  - {name: SHUTDOWN_DELAY, required: false, secret: false, source: static, example: "5s", description: "Wait after SIGTERM before draining, default 5s"}
+  - {name: OTEL_EXPORTER_OTLP_ENDPOINT, required: false, secret: false, source: static, example: "http://otel-collector.observability:4318", description: "OTLP/HTTP collector; no-op when unset"}
+  - {name: OTEL_SERVICE_NAME, required: false, secret: false, source: static, example: "orders-outbox-relay", description: "Service name in telemetry"}
+  - {name: OTEL_RESOURCE_ATTRIBUTES, required: false, secret: false, source: static, example: "deployment.environment=dev", description: "Extra resource attributes"}
+  - {name: DB_HOST, required: true, secret: false, source: terraform-output, example: "<rds-endpoint>", description: "RDS PostgreSQL endpoint host name (must match the TLS certificate)"}
+  - {name: DB_PORT, required: false, secret: false, source: static, example: "5432", description: "Default 5432"}
+  - {name: DB_NAME, required: true, secret: false, source: static, example: "orders", description: "Database name"}
+  - {name: DB_SECRET_ID, required: true, secret: false, source: terraform-output, example: "<secret-name-or-arn>", description: "Secrets Manager secret holding JSON {username,password} (orders_app; the migrate Job uses the orders_migrator secret). The VALUE is never in Git or env"}
+  - {name: DB_MAX_CONNS, required: false, secret: false, source: static, example: "10", description: "pgxpool max connections, default 10"}
+  - {name: DB_STATEMENT_TIMEOUT, required: false, secret: false, source: static, example: "5s", description: "Server-side statement_timeout, default 5s"}
+  - {name: DB_SSL_ROOT_CERT, required: false, secret: false, source: static, example: "/etc/ssl/rds/global-bundle.pem", description: "Override the embedded RDS CA bundle (normally unset)"}
+  - {name: EVENT_BUS_NAME, required: true, secret: false, source: terraform-output, example: "gatepass-dev", description: "EventBridge bus"}
+  - {name: PAYMENTS_QUEUE_URL, required: true, secret: false, source: terraform-output, example: "https://sqs.us-east-1.amazonaws.com/<account-id>/orders-payments", description: "Used only by the payment reconciler"}
+  - {name: OUTBOX_BATCH_SIZE, required: false, secret: false, source: static, example: "25", description: "Rows per cycle, 1-100, default 25"}
+  - {name: OUTBOX_POLL_INTERVAL, required: false, secret: false, source: static, example: "1s", description: "Idle sleep between cycles (min 100ms), default 1s"}
+  - {name: PAYMENT_RECONCILE_AFTER, required: false, secret: false, source: static, example: "30s", description: "Grace period before an unqueued payment is reconciled, default 30s"}
+  - {name: OUTBOX_RETENTION, required: false, secret: false, source: static, example: "168h", description: "How long published outbox rows are kept, default 168h (7 days)"}
+iam:
+  - {action: "secretsmanager:GetSecretValue", resource: "arn:aws:secretsmanager:<region>:<account-id>:secret:<DB_SECRET_ID>-*", why: "Read the database credentials; re-read after a rotation (auth failure)"}
+  - {action: "kms:Decrypt", resource: "the secret's KMS key (only if it is a customer-managed key)", why: "Decrypt the secret value"}
+  - {action: "events:PutEvents", resource: "arn:aws:events:<region>:<account-id>:event-bus/<EVENT_BUS_NAME>", why: "Publish OrderPlaced / OrderPaid / PaymentFailed / OrderCancelled"}
+  - {action: "sqs:SendMessage", resource: "arn:aws:sqs:<region>:<account-id>:orders-payments", why: "Payment reconciler"}
+calls_out: [postgres (rds), secrets-manager, eventbridge, sqs]
+queues: {consumes: [], produces: [orders-payments]}
+events: {publishes: [OrderPlaced, OrderPaid, PaymentFailed, OrderCancelled], consumes: []}
+database: {engine: postgres, auth: secret, migrate_command: null}
+scaling_hint: {cpu_request: 50m, memory_request: 64Mi, hpa_metric: null, keda_queue: null}
+metrics: [outbox_unpublished, outbox_publish_latency_seconds, outbox_published_total, outbox_publish_failures_total]

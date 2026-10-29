@@ -1,0 +1,180 @@
+openapi: 3.1.0
+info:
+  title: Gatepass Orders API
+  version: 1.0.0
+  description: >
+    Orders for ticket holds. Public routes live under /orders/v1 and need a Cognito
+    ACCESS token. Errors are RFC 9457 application/problem+json. Payment is simulated
+    asynchronously: poll the order or wait for the OrderPaid / PaymentFailed email.
+servers:
+  - url: https://api.example.com
+security:
+  - bearer: []
+paths:
+  /orders/v1/orders:
+    post:
+      operationId: ordersCreateOrder
+      summary: Create an order from a hold
+      description: >
+        Idempotency-Key is required. Same key and same body returns the original response
+        (header Idempotent-Replayed: true); same key and a different body returns 409.
+      parameters:
+        - {name: Idempotency-Key, in: header, required: true, schema: {type: string, minLength: 8, maxLength: 128}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [holdId]
+              additionalProperties: false
+              properties:
+                holdId: {type: string, format: uuid}
+      responses:
+        '201':
+          description: Order created in status pending_payment
+          headers:
+            Idempotent-Replayed: {schema: {type: string, enum: ['true']}}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Order'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '409':
+          description: hold_expired, hold_released, hold_already_used, order_exists or idempotency_key_reused
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /orders/v1/orders/{orderId}:
+    parameters:
+      - {name: orderId, in: path, required: true, schema: {type: string, format: uuid}}
+    get:
+      operationId: ordersGetOrder
+      summary: Get an order (owner or admin)
+      responses:
+        '200':
+          description: The order
+          headers:
+            ETag: {schema: {type: string}}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Order'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+  /orders/v1/me/orders:
+    get:
+      operationId: ordersListMyOrders
+      summary: The caller's orders, newest first
+      parameters:
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 20}}
+        - {name: cursor, in: query, schema: {type: string}}
+      responses:
+        '200':
+          description: A page of orders
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: {type: array, items: {$ref: '#/components/schemas/Order'}}
+                  nextCursor: {type: string}
+        '401': {$ref: '#/components/responses/Problem'}
+  /orders/v1/orders/{orderId}/cancel:
+    parameters:
+      - {name: orderId, in: path, required: true, schema: {type: string, format: uuid}}
+    post:
+      operationId: ordersCancelOrder
+      summary: Cancel an order (owner). Allowed from pending_payment or paid; idempotent.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                reason: {type: string, maxLength: 200}
+      responses:
+        '200':
+          description: The cancelled order
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Order'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+  /orders/v1/orders/{orderId}/history:
+    parameters:
+      - {name: orderId, in: path, required: true, schema: {type: string, format: uuid}}
+    get:
+      operationId: ordersGetOrderHistory
+      summary: Status history (owner or admin)
+      responses:
+        '200':
+          description: History, oldest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [orderId, history]
+                properties:
+                  orderId: {type: string, format: uuid}
+                  history:
+                    type: array
+                    items:
+                      type: object
+                      required: [status, at]
+                      properties:
+                        status: {$ref: '#/components/schemas/Status'}
+                        reason: {type: string}
+                        at: {type: string, format: date-time}
+        '401': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+components:
+  securitySchemes:
+    bearer: {type: http, scheme: bearer, bearerFormat: JWT}
+  responses:
+    Problem:
+      description: Error (RFC 9457)
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+  schemas:
+    Status:
+      type: string
+      enum: [pending_payment, paid, payment_failed, cancelled]
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: {type: string}
+        title: {type: string}
+        status: {type: integer}
+        detail: {type: string}
+        code: {type: string}
+        requestId: {type: string}
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: {type: string}
+              reason: {type: string}
+    Order:
+      type: object
+      required: [id, userId, holdId, eventId, ticketTypeId, quantity, amountCents, currency, status, createdAt, updatedAt, version]
+      properties:
+        id: {type: string, format: uuid}
+        userId: {type: string}
+        holdId: {type: string, format: uuid}
+        eventId: {type: string, format: uuid}
+        ticketTypeId: {type: string, format: uuid}
+        quantity: {type: integer, minimum: 1, maximum: 8}
+        amountCents: {type: integer, description: quantity x the price snapshot of the hold}
+        currency: {type: string}
+        status: {$ref: '#/components/schemas/Status'}
+        createdAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
+        version: {type: integer}

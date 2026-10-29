@@ -11,9 +11,9 @@ Written incrementally while building; read this first. Placeholders (`<account-i
 | `catalog-api` (+ `migrate`) | done | unit + local-container integration verified, see section 1 commands |
 | `reservations-api` | done | public + internal HTTP, inventory SQS consumer (`CONSUMER_ENABLED`), unit tests, integration tests run against DynamoDB Local + Redis |
 | `lambda-hold-expirer` | done | both payload shapes; handler unit-tested and exercised against DynamoDB Local |
-| `orders-api` (+ `migrate`) | missing | |
-| `orders-worker` | missing | |
-| `orders-outbox-relay` | missing | |
+| `orders-api` (+ `migrate`) | done | unit tests; integration against local Postgres |
+| `orders-worker` | done | unit tests; poison/DLQ integration test written, needs real SQS |
+| `orders-outbox-relay` | done | two-relay exactly-once verified against local Postgres |
 | `notifications-api` | missing | |
 | `notifications-worker` | missing | |
 | `lambda-nightly-report` | missing | |
@@ -27,6 +27,8 @@ Checks run after every step: `go build ./...`, `go vet ./...`, `go vet -tags int
 - After catalog: `go build ./...`, `go vet ./...`, `go vet -tags integration ./...`, `golangci-lint run`, `go test ./...` all pass. Catalog integration tests `TestPostgresRepositories` and `TestCacheAsideAgainstRealRedisAndOutageFallback` were run against **throwaway local containers** (postgres:17 and redis:7, started with `docker run`, nothing committed) and pass; this verified the SQL (keyset pagination, optimistic locking, migrations, bootstrap grants) and cache-aside/outage fallback. The AWS-dependent catalog integration tests (RDS IAM auth, S3 presign, PutEvents to SQS) compile but were not run.
 
 - After reservations (+ hold-expirer): `go build ./...`, `go vet ./...`, `go vet -tags integration ./...`, `golangci-lint run`, `go test ./...` all pass. `go test -tags integration ./internal/reservations/integration/` was run against **DynamoDB Local** (`amazon/dynamodb-local` container, `AWS_ENDPOINT_URL_DYNAMODB`, dummy credentials) and a local redis:7: 50 concurrent holds vs 10 tickets -> exactly 10, idempotent create/consume, expiry released once through both Lambda shapes, consumer idempotency, GSI pagination, Lua rate limiter all PASS. Only `TestScheduleCreatedAndDeleted` was skipped (needs real EventBridge Scheduler). DynamoDB Local does not reproduce real-DynamoDB contention (`TransactionConflict`); that path is covered by a unit test with a scripted client.
+
+- After orders (3 binaries): all five checks pass, `docker build --build-arg BINARY=orders-api --platform linux/amd64` succeeds. `go test -tags integration ./internal/orders/integration/` was run (3 times) against a **local postgres:17 container**: idempotency (replay does not re-consume, different body -> 409, 20 concurrent duplicates -> one order), rollback leaves no rows, two relays publish 300 rows exactly once each (`FOR UPDATE SKIP LOCKED`), cancel-vs-payment races end in a legal state with matching history/outbox, the payment reconciler, and secret rotation (reconnect after one auth failure, using an in-memory fake of the Secrets Manager port) all PASS. Skipped (need AWS): `TestPoisonMessageReachesDLQAfterMaxReceives`, `TestSecretRotationAgainstRealSecretsManager`. The orders bootstrap SQL below was verified locally (app can DML but not DDL, report user is read-only).
 
 <!-- END-S1 -->
 
@@ -51,6 +53,10 @@ Per-binary lists are in `contracts/<binary>.yaml` (name, required, secret, sourc
 
 - **reservations-api** (`*` required; the second group is required only when `API_ENABLED=true`): `TABLE_NAME*, API_ENABLED, CONSUMER_ENABLED, INVENTORY_QUEUE_URL (if CONSUMER_ENABLED), CONSUMER_WORKERS, CONSUMER_VISIBILITY_TIMEOUT, INTERNAL_HTTP_ADDR, HOLD_TTL, RATE_LIMIT_PER_MINUTE`; API mode: `COGNITO_ISSUER, COGNITO_CLIENT_ID, SCHEDULER_GROUP_NAME, SCHEDULER_ROLE_ARN, EXPIRER_LAMBDA_ARN, REDIS_ADDR, REDIS_USER, REDIS_IAM_AUTH, CACHE_NAME, REDIS_SERVERLESS, REDIS_AUTH_FILE`.
 - **lambda-hold-expirer**: `TABLE_NAME*`, `AWS_REGION` (runtime), `LOG_LEVEL`.
+
+- **orders-api** (`migrate` uses `AWS_REGION, DB_HOST, DB_PORT, DB_NAME, DB_SECRET_ID` with the migrator's secret): `DB_HOST*, DB_PORT, DB_NAME*, DB_SECRET_ID*, DB_MAX_CONNS, DB_STATEMENT_TIMEOUT, DB_SSL_ROOT_CERT, RESERVATIONS_INTERNAL_URL*, PAYMENTS_QUEUE_URL*, COGNITO_ISSUER*, COGNITO_CLIENT_ID*`.
+- **orders-worker**: DB vars as above, `PAYMENTS_QUEUE_URL*, WORKER_CONCURRENCY, CONSUMER_VISIBILITY_TIMEOUT, PAYMENT_SUCCESS_RATE`.
+- **orders-outbox-relay**: DB vars as above, `EVENT_BUS_NAME*, PAYMENTS_QUEUE_URL*, OUTBOX_BATCH_SIZE, OUTBOX_POLL_INTERVAL, PAYMENT_RECONCILE_AFTER, OUTBOX_RETENTION`.
 
 <!-- END-S2 -->
 
@@ -97,6 +103,32 @@ UNVERIFIED: DynamoDB transactions are authorised by the item-level actions above
 
 Trust policy: `scheduler.amazonaws.com` (add `aws:SourceAccount` condition). Permission: `lambda:InvokeFunction` on `EXPIRER_LAMBDA_ARN`.
 
+### orders-api
+
+| Action | Resource | Why |
+|---|---|---|
+| `secretsmanager:GetSecretValue` | the `orders_app` secret ARN | database credentials; re-read after an authentication failure (rotation) |
+| `kms:Decrypt` | the secret's CMK (only if customer-managed) | decrypt the secret |
+| `sqs:SendMessage` | `orders-payments` queue ARN | queue the payment request |
+
+Network (not IAM): HTTP to the reservations **internal** Service (port 8081), RDS 5432, and Cognito JWKS (HTTPS egress).
+
+### orders-worker
+
+`secretsmanager:GetSecretValue` (+ `kms:Decrypt`); `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:ChangeMessageVisibility` on `orders-payments`.
+
+### orders-outbox-relay
+
+`secretsmanager:GetSecretValue` (+ `kms:Decrypt`); `events:PutEvents` on the bus ARN; `sqs:SendMessage` on `orders-payments` (payment reconciler).
+
+### orders migrate Job
+
+`secretsmanager:GetSecretValue` on the `orders_migrator` secret only.
+
+### nightly report Lambda (see its section when present)
+
+`rds-db:connect` on `.../dbuser:<db-resource-id>/orders_report`, `s3:PutObject` on `reports/*`.
+
 <!-- END-S3 -->
 
 ## 4. AWS resources the code expects
@@ -132,6 +164,31 @@ ALTER DEFAULT PRIVILEGES FOR ROLE catalog_migrator IN SCHEMA public
 - **ElastiCache** user for reservations (same mechanism as catalog), key prefix `rl:`.
 - Recommended CloudWatch alarms: DLQ depth > 0; Lambda errors; `holds_expired_released_total` flat while holds are created (expiry broken).
 
+### orders
+
+- **RDS PostgreSQL** database `orders` (can be the same instance as `catalog`, different database). Users `orders_migrator`, `orders_app` (passwords in Secrets Manager, **no password in Git**), `orders_report` (IAM auth, read-only, used by the nightly report Lambda). Bootstrap SQL run once as the master user (verified locally; replace the placeholders from Secrets Manager values):
+
+```sql
+CREATE DATABASE orders;
+\c orders
+CREATE ROLE orders_migrator LOGIN PASSWORD '<value from the migrator secret>';
+CREATE ROLE orders_app      LOGIN PASSWORD '<value from the app secret>';
+CREATE ROLE orders_report   LOGIN;  GRANT rds_iam TO orders_report;
+GRANT CONNECT ON DATABASE orders TO orders_migrator, orders_app, orders_report;
+GRANT USAGE, CREATE ON SCHEMA public TO orders_migrator;
+GRANT USAGE ON SCHEMA public TO orders_app, orders_report;
+ALTER DEFAULT PRIVILEGES FOR ROLE orders_migrator IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO orders_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE orders_migrator IN SCHEMA public
+  GRANT USAGE, SELECT ON SEQUENCES TO orders_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE orders_migrator IN SCHEMA public
+  GRANT SELECT ON TABLES TO orders_report;
+```
+- **Secrets Manager** secrets (JSON `{"username":"...","password":"..."}`): `orders_app` (`DB_SECRET_ID` of api/worker/relay) and `orders_migrator` (`DB_SECRET_ID` of the migrate Job). Rotation is supported by the code (re-read after one authentication failure, connections recycled every 30 min); a rotation that alternates two users (RDS "alternating users" strategy) keeps `username` in the secret JSON current, which the code honours.
+- **SQS** `orders-payments` + DLQ: `maxReceiveCount` 5, visibility timeout >= 60 s. The payments queue is NOT fed by EventBridge; the API and the reconciler send to it directly.
+- **EventBridge** bus: same as catalog. Source used by orders: `gatepass.orders`.
+- Recommended alarms: DLQ not empty; `outbox_unpublished` > 0 for 5 min; `orders_payment_enqueue_failures_total` rate; relay pod count < 1.
+
 <!-- END-S4 -->
 
 ## 5. Event rules
@@ -147,6 +204,8 @@ Three rules on bus `gatepass-<env>`, all with the inventory queue as target (SQS
 | inventory-event-published | `{"source":["gatepass.catalog"],"detail-type":["EventPublished"]}` |
 | inventory-payment-failed | `{"source":["gatepass.orders"],"detail-type":["PaymentFailed"]}` |
 | inventory-order-cancelled | `{"source":["gatepass.orders"],"detail-type":["OrderCancelled"]}` |
+
+- Published by orders (source `gatepass.orders`, via the outbox relay): `OrderPlaced`, `OrderPaid`, `PaymentFailed`, `OrderCancelled`. Consumer rules: reservations (PaymentFailed, OrderCancelled, see above); notifications rules are listed in the notifications section. Optionally an archive of the whole bus for `OrderPlaced` audit.
 
 <!-- END-S5 -->
 
@@ -181,6 +240,16 @@ Three rules on bus `gatepass-<env>`, all with the inventory queue as target (SQS
 - reservations: unknown/irrelevant event types and releases for holds that no longer exist are acknowledged (logged), never sent to the DLQ.
 - hold-expirer: an early Scheduler firing (`now < expiresAt`) returns an error so Scheduler's retry policy re-invokes it.
 
+- orders: **order ids are deterministic** (UUID v5 of user + Idempotency-Key + hold id), not UUIDv7. This makes "crash after reservations consumed the hold, before the order committed" recoverable by a client retry. Outbox ids / event ids are UUIDv7.
+- orders: the payment enqueue after commit is not atomic with the commit. A `payment_enqueued_at` column plus a **reconciler inside `orders-outbox-relay`** closes the gap (extra, not in the plan). The relay therefore needs `sqs:SendMessage`.
+- orders: transition timestamps (`updated_at`, history `at`, outbox `created_at`) come from `clock_timestamp()` inside the locked transaction, so they follow commit order (found by an integration test: using the caller's clock re-ordered `OrderCancelled` before `OrderPaid`).
+- orders: a payment approval that arrives for an already **cancelled** order is ignored (logged); refunds are out of scope. `Cancel` of a `payment_failed` order is refused (409): its tickets were already released.
+- orders: simulated payment outcomes: success `PAYMENT_SUCCESS_RATE`; the remainder splits 50/50 into permanent decline (`card_declined`) and transient error (retry via SQS).
+- orders: idempotency key retention 24 h (rows cleaned by the relay every 10 min); keys are scoped per user. Replay returns the stored JSON (jsonb re-serialised, semantically identical).
+- orders: readiness checks only Postgres. A reservations outage returns 503 on `POST /orders` but reads still work.
+- orders: outbox published rows are deleted after `OUTBOX_RETENTION` (default 7 days) by the relay; this needs DELETE on `outbox`/`idempotency_keys` for `orders_app` (granted by the default privileges above).
+- orders: cancel body is optional (`{"reason": "..."}`), default reason `cancelled by user`; only the owner may cancel (admins can read, not cancel).
+
 <!-- END-S6 -->
 
 ## 7. UNVERIFIED items
@@ -194,6 +263,11 @@ Three rules on bus `gatepass-<env>`, all with the inventory queue as target (SQS
 - hold-expirer: DynamoDB Streams TTL-deletion record shape (`userIdentity.type=Service`, `principalId=dynamodb.amazonaws.com`) was modelled from the AWS documentation, not observed; `BatchItemFailures` identifier is the record `SequenceNumber`; EMF metric line appears as a CloudWatch metric.
 - reservations: Lua rate limiter on ElastiCache/Valkey (uses `TIME` inside the script; fine on Redis >= 5 / Valkey, verified only on redis:7 locally).
 - reservations: SQS consumer against a real queue fed by EventBridge rules (envelope parsing is unit tested with a representative document).
+
+- orders: RDS password authentication with TLS verify-full using the embedded RDS CA bundle against a real instance; real Secrets Manager rotation (`TestSecretRotationAgainstRealSecretsManager`, the 28P01 detection through pgx's connect error); behaviour when the secret JSON `username` changes on alternating-user rotation.
+- orders: poison message really lands in the DLQ after 5 receives with the visibility/heartbeat settings (`TestPoisonMessageReachesDLQAfterMaxReceives`); heartbeat `ChangeMessageVisibility` against real SQS.
+- orders: EventBridge `PutEvents` from the relay with the real bus; entry size limits (events are small).
+- orders: the `Transition` row lock and `clock_timestamp()` ordering under the production RDS parameter group (verified on postgres:17 only).
 
 <!-- END-S7 -->
 

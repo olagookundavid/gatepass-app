@@ -1,0 +1,40 @@
+name: orders-api
+service: orders
+kind: http-api
+image_binary: orders-api
+ports: {public: 8080, internal: null}
+base_path: /orders
+probes: {live: /livez, ready: /readyz, version: /version}
+graceful_shutdown_seconds: 30
+config_change_requires_restart: true
+env:
+  - {name: AWS_REGION, required: true, secret: false, source: static, example: "us-east-1", description: "Region for every SDK client"}
+  - {name: AWS_MAX_ATTEMPTS, required: false, secret: false, source: static, example: "3", description: "SDK retry attempts (1-10), default 3"}
+  - {name: LOG_LEVEL, required: false, secret: false, source: static, example: "info", description: "debug|info|warn|error"}
+  - {name: HTTP_ADDR, required: false, secret: false, source: static, example: ":8080", description: "Public listener, default :8080"}
+  - {name: BASE_PATH, required: false, secret: false, source: static, example: "/orders", description: "Public route prefix, default /orders; the Ingress does not strip it"}
+  - {name: SHUTDOWN_DELAY, required: false, secret: false, source: static, example: "5s", description: "Wait after SIGTERM before draining, default 5s"}
+  - {name: OTEL_EXPORTER_OTLP_ENDPOINT, required: false, secret: false, source: static, example: "http://otel-collector.observability:4318", description: "OTLP/HTTP collector; no-op when unset"}
+  - {name: OTEL_SERVICE_NAME, required: false, secret: false, source: static, example: "orders-api", description: "Service name in telemetry"}
+  - {name: OTEL_RESOURCE_ATTRIBUTES, required: false, secret: false, source: static, example: "deployment.environment=dev", description: "Extra resource attributes"}
+  - {name: COGNITO_ISSUER, required: true, secret: false, source: terraform-output, example: "https://cognito-idp.us-east-1.amazonaws.com/<user-pool-id>", description: "Expected iss claim"}
+  - {name: COGNITO_CLIENT_ID, required: true, secret: false, source: terraform-output, example: "<app-client-id>", description: "Expected client_id claim of access tokens"}
+  - {name: DB_HOST, required: true, secret: false, source: terraform-output, example: "<rds-endpoint>", description: "RDS PostgreSQL endpoint host name (must match the TLS certificate)"}
+  - {name: DB_PORT, required: false, secret: false, source: static, example: "5432", description: "Default 5432"}
+  - {name: DB_NAME, required: true, secret: false, source: static, example: "orders", description: "Database name"}
+  - {name: DB_SECRET_ID, required: true, secret: false, source: terraform-output, example: "<secret-name-or-arn>", description: "Secrets Manager secret holding JSON {username,password} (orders_app; the migrate Job uses the orders_migrator secret). The VALUE is never in Git or env"}
+  - {name: DB_MAX_CONNS, required: false, secret: false, source: static, example: "10", description: "pgxpool max connections, default 10"}
+  - {name: DB_STATEMENT_TIMEOUT, required: false, secret: false, source: static, example: "5s", description: "Server-side statement_timeout, default 5s"}
+  - {name: DB_SSL_ROOT_CERT, required: false, secret: false, source: static, example: "/etc/ssl/rds/global-bundle.pem", description: "Override the embedded RDS CA bundle (normally unset)"}
+  - {name: RESERVATIONS_INTERNAL_URL, required: true, secret: false, source: static, example: "http://reservations-internal.gatepass.svc.cluster.local:8081", description: "Cluster-internal URL of the reservations INTERNAL listener (no trailing path)"}
+  - {name: PAYMENTS_QUEUE_URL, required: true, secret: false, source: terraform-output, example: "https://sqs.us-east-1.amazonaws.com/<account-id>/orders-payments", description: "Payments queue (with DLQ, maxReceiveCount 5)"}
+iam:
+  - {action: "secretsmanager:GetSecretValue", resource: "arn:aws:secretsmanager:<region>:<account-id>:secret:<DB_SECRET_ID>-*", why: "Read the database credentials; re-read after a rotation (auth failure)"}
+  - {action: "kms:Decrypt", resource: "the secret's KMS key (only if it is a customer-managed key)", why: "Decrypt the secret value"}
+  - {action: "sqs:SendMessage", resource: "arn:aws:sqs:<region>:<account-id>:orders-payments", why: "Queue the payment request after an order is committed"}
+calls_out: [postgres (rds), secrets-manager, reservations-api (internal listener, HTTP), sqs, cognito-jwks (public HTTPS)]
+queues: {consumes: [], produces: [orders-payments]}
+events: {publishes: [], consumes: []}      # events are published by orders-outbox-relay from the outbox table
+database: {engine: postgres, auth: secret, migrate_command: "orders-api migrate (run with the orders_migrator secret in DB_SECRET_ID)"}
+scaling_hint: {cpu_request: 100m, memory_request: 128Mi, hpa_metric: cpu, keda_queue: null}
+metrics: [orders_created_total, orders_payment_enqueue_failures_total, db_pool_connections_acquired, db_pool_connections_idle, db_pool_connections_total, db_pool_connections_max, http.server.request.duration]
