@@ -1,0 +1,26 @@
+# golangci-lint v2 configuration.
+# Kept deliberately small: the default "standard" set (errcheck, govet,
+# ineffassign, staticcheck, unused) plus a few linters that catch real AWS-code
+# mistakes (leaked HTTP bodies, wrapped-error comparisons).
+version: "2"
+
+run:
+  timeout: 5m
+  # Lint the integration tests too, so they cannot silently rot.
+  build-tags:
+    - integration
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - errorlint
+    - misspell
+    - unconvert
+  settings:
+    errcheck:
+      exclude-functions:
+        - (net/http.ResponseWriter).Write
+  exclusions:
+    presets:
+      - std-error-handling

@@ -1,0 +1,22 @@
+# Build output
+/bin/
+/dist/
+*.test
+*.out
+coverage.*
+
+# Local env files (only .env.example is committed)
+.env
+.env.*
+!.env.example
+
+# Secrets and keys must never be committed
+*.pem
+!internal/platform/pgdb/certs/global-bundle.pem
+*.key
+*.p12
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
