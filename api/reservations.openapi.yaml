@@ -1,0 +1,208 @@
+openapi: 3.1.0
+info:
+  title: Gatepass Reservations API
+  version: 1.0.0
+  description: >
+    Ticket holds and inventory. Public routes live under /reservations/v1.
+    Errors are RFC 9457 application/problem+json. Authentication is a Cognito
+    ACCESS token. The internal consume endpoint is served on a separate listener
+    that is never exposed through the Ingress.
+servers:
+  - url: https://api.example.com
+security: []
+paths:
+  /reservations/v1/holds:
+    post:
+      operationId: reservationsCreateHold
+      summary: Place a 10 minute hold on tickets
+      description: >
+        Idempotency-Key is required. Same key and same body returns the original hold
+        (header Idempotent-Replayed: true); same key and a different body returns 409.
+        At most 10 holds per user per minute (429 with Retry-After).
+      security: [{bearer: []}]
+      parameters:
+        - {name: Idempotency-Key, in: header, required: true, schema: {type: string, minLength: 8, maxLength: 128}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [eventId, ticketTypeId, quantity]
+              additionalProperties: false
+              properties:
+                eventId: {type: string, format: uuid}
+                ticketTypeId: {type: string, format: uuid}
+                quantity: {type: integer, minimum: 1, maximum: 8}
+      responses:
+        '201':
+          description: Hold created (or replayed)
+          headers:
+            Location: {schema: {type: string}}
+            Idempotent-Replayed: {schema: {type: string, enum: ['true']}}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Hold'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409':
+          description: sold_out, or idempotency_key_reused
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+        '429': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /reservations/v1/holds/{holdId}:
+    parameters:
+      - {name: holdId, in: path, required: true, schema: {type: string, format: uuid}}
+    get:
+      operationId: reservationsGetHold
+      summary: Get a hold (owner only). An active hold past expiresAt reads as "expired".
+      security: [{bearer: []}]
+      responses:
+        '200':
+          description: The hold
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Hold'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+    delete:
+      operationId: reservationsDeleteHold
+      summary: Release an active hold (owner only). Idempotent.
+      security: [{bearer: []}]
+      responses:
+        '204': {description: Released (or already released)}
+        '401': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+  /reservations/v1/me/holds:
+    get:
+      operationId: reservationsListMyHolds
+      summary: The caller's holds, newest first
+      security: [{bearer: []}]
+      parameters:
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 20}}
+        - {name: cursor, in: query, schema: {type: string}}
+      responses:
+        '200':
+          description: A page of holds
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: {type: array, items: {$ref: '#/components/schemas/Hold'}}
+                  nextCursor: {type: string}
+        '401': {$ref: '#/components/responses/Problem'}
+  /reservations/v1/events/{eventId}/inventory:
+    parameters:
+      - {name: eventId, in: path, required: true, schema: {type: string, format: uuid}}
+    get:
+      operationId: reservationsGetInventory
+      summary: Availability per ticket type (public)
+      responses:
+        '200':
+          description: Inventory
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [eventId, ticketTypes]
+                properties:
+                  eventId: {type: string, format: uuid}
+                  ticketTypes:
+                    type: array
+                    items:
+                      type: object
+                      required: [ticketTypeId, available, capacity, priceCents, currency]
+                      properties:
+                        ticketTypeId: {type: string, format: uuid}
+                        available: {type: integer, minimum: 0}
+                        capacity: {type: integer}
+                        priceCents: {type: integer}
+                        currency: {type: string}
+  /internal/v1/holds/{holdId}/consume:
+    parameters:
+      - {name: holdId, in: path, required: true, schema: {type: string, format: uuid}}
+      - {name: X-Caller-Service, in: header, required: true, schema: {type: string}, description: Name of the calling service (logged)}
+    post:
+      operationId: reservationsInternalConsumeHold
+      summary: INTERNAL. Consume a hold for an order. Succeeds once; idempotent per orderId.
+      description: Served only on INTERNAL_HTTP_ADDR (default :8081); no JWT, network restricted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [orderId, userId]
+              additionalProperties: false
+              properties:
+                orderId: {type: string, format: uuid}
+                userId: {type: string}
+      responses:
+        '200':
+          description: Consumed (or already consumed by the same order)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [holdId, eventId, ticketTypeId, quantity, unitPriceCents, currency]
+                properties:
+                  holdId: {type: string, format: uuid}
+                  eventId: {type: string, format: uuid}
+                  ticketTypeId: {type: string, format: uuid}
+                  quantity: {type: integer}
+                  unitPriceCents: {type: integer}
+                  currency: {type: string}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409':
+          description: hold_expired, hold_released or hold_already_consumed (another order)
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+components:
+  securitySchemes:
+    bearer: {type: http, scheme: bearer, bearerFormat: JWT}
+  responses:
+    Problem:
+      description: Error (RFC 9457)
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: {type: string}
+        title: {type: string}
+        status: {type: integer}
+        detail: {type: string}
+        code: {type: string}
+        requestId: {type: string}
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: {type: string}
+              reason: {type: string}
+    Hold:
+      type: object
+      required: [holdId, eventId, ticketTypeId, quantity, unitPriceCents, currency, status, expiresAt, createdAt]
+      properties:
+        holdId: {type: string, format: uuid}
+        eventId: {type: string, format: uuid}
+        ticketTypeId: {type: string, format: uuid}
+        quantity: {type: integer, minimum: 1, maximum: 8}
+        unitPriceCents: {type: integer, description: Price snapshot taken when the inventory was created}
+        currency: {type: string}
+        status: {type: string, enum: [active, consumed, released, expired]}
+        expiresAt: {type: string, format: date-time}
+        createdAt: {type: string, format: date-time}
+        orderId: {type: string, format: uuid}

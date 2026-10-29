@@ -1,0 +1,60 @@
+name: reservations-api
+service: reservations
+kind: http-api            # also runs the inventory SQS consumer when CONSUMER_ENABLED=true (may be deployed twice, see notes)
+image_binary: reservations-api
+ports: {public: 8080, internal: 8081}   # internal = /internal/v1/*, must NEVER be routed by the Ingress; expose with a ClusterIP Service + NetworkPolicy allowing orders only
+base_path: /reservations
+probes: {live: /livez, ready: /readyz, version: /version}   # on the public port, also in consumer-only mode
+graceful_shutdown_seconds: 30
+config_change_requires_restart: true
+notes:
+  - "Two deployments from one image are supported. API: API_ENABLED=true CONSUMER_ENABLED=false (scale on CPU). Consumer: API_ENABLED=false CONSUMER_ENABLED=true (scale on queue depth, KEDA)."
+  - "In consumer-only mode only AWS_REGION, TABLE_NAME, INVENTORY_QUEUE_URL (+ common optional vars) are required."
+env:
+  - {name: AWS_REGION, required: true, secret: false, source: static, example: "us-east-1", description: "Region for every SDK client"}
+  - {name: AWS_MAX_ATTEMPTS, required: false, secret: false, source: static, example: "3", description: "SDK retry attempts (1-10), default 3"}
+  - {name: LOG_LEVEL, required: false, secret: false, source: static, example: "info", description: "debug|info|warn|error"}
+  - {name: HTTP_ADDR, required: false, secret: false, source: static, example: ":8080", description: "Public listener, default :8080"}
+  - {name: INTERNAL_HTTP_ADDR, required: false, secret: false, source: static, example: ":8081", description: "Internal listener (consume endpoint), default :8081; only started when API_ENABLED=true"}
+  - {name: BASE_PATH, required: false, secret: false, source: static, example: "/reservations", description: "Public route prefix, default /reservations"}
+  - {name: SHUTDOWN_DELAY, required: false, secret: false, source: static, example: "5s", description: "Wait after SIGTERM before draining, default 5s"}
+  - {name: OTEL_EXPORTER_OTLP_ENDPOINT, required: false, secret: false, source: static, example: "http://otel-collector.observability:4318", description: "OTLP/HTTP collector; no-op when unset"}
+  - {name: OTEL_SERVICE_NAME, required: false, secret: false, source: static, example: "reservations-api", description: "Service name in telemetry"}
+  - {name: OTEL_RESOURCE_ATTRIBUTES, required: false, secret: false, source: static, example: "deployment.environment=dev", description: "Extra resource attributes"}
+  - {name: TABLE_NAME, required: true, secret: false, source: terraform-output, example: "<reservations-table>", description: "DynamoDB table (PK, SK, GSI1 on GSI1PK/GSI1SK, TTL attribute ttl)"}
+  - {name: API_ENABLED, required: false, secret: false, source: static, example: "true", description: "Serve the public and internal APIs, default true"}
+  - {name: CONSUMER_ENABLED, required: false, secret: false, source: static, example: "false", description: "Run the inventory SQS consumer, default false"}
+  - {name: INVENTORY_QUEUE_URL, required: false, secret: false, source: terraform-output, example: "https://sqs.us-east-1.amazonaws.com/<account-id>/reservations-inventory", description: "Required when CONSUMER_ENABLED=true"}
+  - {name: CONSUMER_WORKERS, required: false, secret: false, source: static, example: "4", description: "Concurrent message handlers, default 4"}
+  - {name: CONSUMER_VISIBILITY_TIMEOUT, required: false, secret: false, source: static, example: "60s", description: "SQS visibility timeout set while handling (extended by a heartbeat), default 60s"}
+  - {name: COGNITO_ISSUER, required: false, secret: false, source: terraform-output, example: "https://cognito-idp.us-east-1.amazonaws.com/<user-pool-id>", description: "Required when API_ENABLED=true"}
+  - {name: COGNITO_CLIENT_ID, required: false, secret: false, source: terraform-output, example: "<app-client-id>", description: "Required when API_ENABLED=true"}
+  - {name: SCHEDULER_GROUP_NAME, required: false, secret: false, source: terraform-output, example: "gatepass-holds", description: "EventBridge Scheduler group holding hold-<id> schedules; required when API_ENABLED=true"}
+  - {name: SCHEDULER_ROLE_ARN, required: false, secret: false, source: terraform-output, example: "arn:aws:iam::<account-id>:role/gatepass-scheduler-invoke-expirer", description: "Role Scheduler assumes to invoke the Lambda; reservations-api needs iam:PassRole on it; required when API_ENABLED=true"}
+  - {name: EXPIRER_LAMBDA_ARN, required: false, secret: false, source: terraform-output, example: "arn:aws:lambda:us-east-1:<account-id>:function:gatepass-hold-expirer", description: "Schedule target; required when API_ENABLED=true"}
+  - {name: HOLD_TTL, required: false, secret: false, source: static, example: "10m", description: "How long a hold lasts, 1m-1h, default 10m"}
+  - {name: RATE_LIMIT_PER_MINUTE, required: false, secret: false, source: static, example: "10", description: "POST /holds per user per minute, default 10"}
+  - {name: REDIS_ADDR, required: false, secret: false, source: terraform-output, example: "<elasticache-endpoint>:6379", description: "ElastiCache host:port (TLS); required when API_ENABLED=true"}
+  - {name: REDIS_USER, required: false, secret: false, source: static, example: "reservations", description: "Redis ACL user"}
+  - {name: REDIS_IAM_AUTH, required: false, secret: false, source: static, example: "true", description: "Use an IAM token as the Redis password"}
+  - {name: CACHE_NAME, required: false, secret: false, source: terraform-output, example: "<cache-name>", description: "ElastiCache name for the IAM token; required when REDIS_IAM_AUTH=true"}
+  - {name: REDIS_SERVERLESS, required: false, secret: false, source: static, example: "false", description: "true for ElastiCache Serverless"}
+  - {name: REDIS_AUTH_FILE, required: false, secret: true, source: mounted-secret, example: "/var/run/secrets/redis/password", description: "Fallback AUTH password file"}
+iam:
+  - {action: "dynamodb:GetItem", resource: "arn:aws:dynamodb:<region>:<account-id>:table/<TABLE_NAME>", why: "Read inventory, holds, idempotency records, processed-event markers (consistent reads)"}
+  - {action: "dynamodb:Query", resource: "arn:aws:dynamodb:<region>:<account-id>:table/<TABLE_NAME> and .../index/GSI1", why: "List inventory of an event; list a user's holds via GSI1"}
+  - {action: "dynamodb:PutItem", resource: "arn:aws:dynamodb:<region>:<account-id>:table/<TABLE_NAME>", why: "Create inventory (if absent), processed-event markers, and the hold/idempotency/release-marker puts inside transactions"}
+  - {action: "dynamodb:UpdateItem", resource: "arn:aws:dynamodb:<region>:<account-id>:table/<TABLE_NAME>", why: "Decrement/increment inventory, consume/release holds (single and inside transactions). Transactions are authorised through these item actions (UNVERIFIED)"}
+  - {action: "scheduler:CreateSchedule", resource: "arn:aws:scheduler:<region>:<account-id>:schedule/<SCHEDULER_GROUP_NAME>/hold-*", why: "One-time expiry schedule per hold"}
+  - {action: "scheduler:DeleteSchedule", resource: "arn:aws:scheduler:<region>:<account-id>:schedule/<SCHEDULER_GROUP_NAME>/hold-*", why: "Remove the schedule when a hold is consumed or deleted"}
+  - {action: "iam:PassRole", resource: "<SCHEDULER_ROLE_ARN> with condition iam:PassedToService=scheduler.amazonaws.com", why: "CreateSchedule hands the invoke role to EventBridge Scheduler; without PassRole it fails with AccessDenied"}
+  - {action: "sqs:ReceiveMessage", resource: "arn:aws:sqs:<region>:<account-id>:<inventory-queue>", why: "Consumer long polling (CONSUMER_ENABLED=true)"}
+  - {action: "sqs:DeleteMessage", resource: "arn:aws:sqs:<region>:<account-id>:<inventory-queue>", why: "Acknowledge after successful handling"}
+  - {action: "sqs:ChangeMessageVisibility", resource: "arn:aws:sqs:<region>:<account-id>:<inventory-queue>", why: "Heartbeat extension while a handler runs"}
+  - {action: "elasticache:Connect", resource: "cache and user ARNs", why: "Redis IAM auth, only when REDIS_IAM_AUTH=true"}
+calls_out: [dynamodb, eventbridge-scheduler, elasticache, sqs, cognito-jwks (public HTTPS)]
+queues: {consumes: [reservations-inventory], produces: []}
+events: {publishes: [], consumes: [EventPublished, PaymentFailed, OrderCancelled]}
+database: {engine: dynamodb, auth: iam, migrate_command: null}
+scaling_hint: {cpu_request: 100m, memory_request: 128Mi, hpa_metric: cpu, keda_queue: reservations-inventory}
+metrics: [reservations_holds_created_total, reservations_holds_rejected_total, reservations_holds_consumed_total, reservations_holds_expired_released_total, reservations_inventory_events_processed_total, reservations_rate_limiter_errors_total, sqs_messages_received_total, sqs_messages_failed_total, http.server.request.duration]

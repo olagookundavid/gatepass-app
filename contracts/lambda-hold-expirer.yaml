@@ -1,0 +1,40 @@
+name: lambda-hold-expirer
+service: reservations
+kind: lambda
+image_binary: lambda-hold-expirer    # not a container: `make lambda-zip` builds dist/lambda-hold-expirer.zip (bootstrap, linux/arm64)
+ports: {public: null, internal: null}
+base_path: null
+probes: null
+graceful_shutdown_seconds: null
+config_change_requires_restart: true
+lambda:
+  runtime: provided.al2023
+  architecture: arm64
+  handler: bootstrap
+  memory_mb: 128
+  timeout_seconds: 15
+  vpc: false     # DynamoDB is reached over the public endpoint (or a gateway VPC endpoint if you attach it to a VPC)
+  reserved_concurrency: null
+  triggers:
+    - {type: eventbridge-scheduler, detail: "Invoked by one-time schedules named hold-<holdId> in group SCHEDULER_GROUP_NAME with input {\"holdId\":\"...\"}. The Scheduler execution role needs lambda:InvokeFunction on this function."}
+    - {type: dynamodb-stream, detail: "Event source mapping on the reservations table stream (view type NEW_AND_OLD_IMAGES, or OLD_IMAGE at minimum), starting position LATEST, FunctionResponseTypes=[ReportBatchItemFailures], batch size 10-100, maximum retry attempts bounded with an on-failure destination (SQS) so a bad record cannot block the shard. Optional filter: eventName=REMOVE and userIdentity.type=Service."}
+env:
+  - {name: TABLE_NAME, required: true, secret: false, source: terraform-output, example: "<reservations-table>", description: "Same DynamoDB table as reservations-api"}
+  - {name: AWS_REGION, required: true, secret: false, source: lambda-runtime, example: "us-east-1", description: "Set by the Lambda runtime"}
+  - {name: LOG_LEVEL, required: false, secret: false, source: static, example: "info", description: "debug|info|warn|error"}
+  - {name: AWS_MAX_ATTEMPTS, required: false, secret: false, source: static, example: "3", description: "SDK retry attempts"}
+iam:
+  - {action: "dynamodb:GetItem", resource: "arn:aws:dynamodb:<region>:<account-id>:table/<TABLE_NAME>", why: "Load hold and inventory"}
+  - {action: "dynamodb:UpdateItem", resource: "arn:aws:dynamodb:<region>:<account-id>:table/<TABLE_NAME>", why: "Release the hold and return tickets (transaction)"}
+  - {action: "dynamodb:PutItem", resource: "arn:aws:dynamodb:<region>:<account-id>:table/<TABLE_NAME>", why: "Release marker for holds already deleted by TTL (transaction)"}
+  - {action: "dynamodb:DescribeStream", resource: "<table stream ARN>", why: "Stream event source mapping"}
+  - {action: "dynamodb:GetRecords", resource: "<table stream ARN>", why: "Stream event source mapping"}
+  - {action: "dynamodb:GetShardIterator", resource: "<table stream ARN>", why: "Stream event source mapping"}
+  - {action: "dynamodb:ListStreams", resource: "*", why: "Stream event source mapping"}
+  - {action: "logs:CreateLogGroup / logs:CreateLogStream / logs:PutLogEvents", resource: "the function's log group", why: "Logs and the EMF metric line"}
+calls_out: [dynamodb]
+queues: {consumes: [], produces: []}
+events: {publishes: [], consumes: []}
+database: {engine: dynamodb, auth: iam, migrate_command: null}
+scaling_hint: {cpu_request: null, memory_request: null, hpa_metric: null, keda_queue: null}
+metrics: [holds_expired_released_total]    # CloudWatch EMF: namespace Gatepass, dimension Service=hold-expirer
