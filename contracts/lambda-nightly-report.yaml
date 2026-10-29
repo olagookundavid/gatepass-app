@@ -1,0 +1,42 @@
+name: lambda-nightly-report
+service: reports
+kind: lambda
+image_binary: lambda-nightly-report    # not a container: `make lambda-zip` builds dist/lambda-nightly-report.zip (bootstrap, linux/arm64)
+ports: {public: null, internal: null}
+base_path: null
+probes: null
+graceful_shutdown_seconds: null
+config_change_requires_restart: true
+lambda:
+  runtime: provided.al2023
+  architecture: arm64
+  handler: bootstrap
+  memory_mb: 256
+  timeout_seconds: 60
+  vpc: true            # must run in the VPC private subnets that can reach RDS; security group egress to RDS 5432
+  reserved_concurrency: 1   # one report at a time; also protects the database
+  network_notes:
+    - "Needs a route to S3: a gateway VPC endpoint for S3 (free) or a NAT gateway."
+    - "Needs a route to the RDS IAM-token signing only locally (no network call); no STS call is made for rds-db tokens."
+    - "RDS security group must allow the Lambda security group on 5432."
+  triggers:
+    - {type: eventbridge-scheduler, detail: "Daily, e.g. cron(5 0 * * ? *) UTC, flexible window off, payload {}. Optional payload {\"date\":\"YYYY-MM-DD\"} regenerates a finished UTC day. Scheduler role needs lambda:InvokeFunction. Retry policy: a few attempts (the function is idempotent)."}
+env:
+  - {name: DB_HOST, required: true, secret: false, source: terraform-output, example: "<rds-endpoint>", description: "RDS endpoint host name of the orders database (must match the TLS certificate)"}
+  - {name: DB_PORT, required: false, secret: false, source: static, example: "5432", description: "Default 5432"}
+  - {name: DB_NAME, required: true, secret: false, source: static, example: "orders", description: "Orders database name"}
+  - {name: DB_USER, required: true, secret: false, source: static, example: "orders_report", description: "Read-only database user created WITH rds_iam"}
+  - {name: REPORTS_BUCKET, required: true, secret: false, source: terraform-output, example: "<reports-bucket>", description: "S3 bucket for reports/YYYY/MM/DD.csv"}
+  - {name: AWS_REGION, required: true, secret: false, source: lambda-runtime, example: "us-east-1", description: "Set by the Lambda runtime"}
+  - {name: LOG_LEVEL, required: false, secret: false, source: static, example: "info", description: "debug|info|warn|error"}
+iam:
+  - {action: "rds-db:connect", resource: "arn:aws:rds-db:<region>:<account-id>:dbuser:<db-resource-id>/orders_report", why: "IAM database authentication as the read-only user"}
+  - {action: "s3:PutObject", resource: "arn:aws:s3:::<REPORTS_BUCKET>/reports/*", why: "Write (overwrite) the daily CSV"}
+  - {action: "ec2:CreateNetworkInterface / DescribeNetworkInterfaces / DeleteNetworkInterface", resource: "*", why: "VPC-attached Lambda (managed policy AWSLambdaVPCAccessExecutionRole)"}
+  - {action: "logs:CreateLogGroup / logs:CreateLogStream / logs:PutLogEvents", resource: "the function's log group", why: "Logs"}
+calls_out: [postgres (rds, read-only), s3]
+queues: {consumes: [], produces: []}
+events: {publishes: [], consumes: []}
+database: {engine: postgres, auth: iam, migrate_command: null}
+scaling_hint: {cpu_request: null, memory_request: null, hpa_metric: null, keda_queue: null}
+metrics: []    # alarm on Lambda Errors and on a missing object reports/<yesterday>.csv
