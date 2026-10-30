@@ -1,0 +1,21 @@
+# gitleaks configuration (used locally and by CI).
+#
+# We extend the default ruleset and only allow two known false positives of the
+# generic-api-key rule. Keep this list short: every entry hides a class of finding
+# from the scanner, so each one needs a reason.
+title = "gatepass-app gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known false positives of the generic-api-key rule"
+regexTarget = "line"
+regexes = [
+  # Unit tests send placeholder Idempotency-Key header values such as "key-12345678".
+  # They are test inputs, not credentials.
+  '''Idempotency-Key"\s*:\s*"[A-Za-z0-9-]+"''',
+  # A prose note in contracts/reservations-api.yaml ("API: API_ENABLED=true ...")
+  # that looks like "api: <value>" to the rule.
+  '''API: API_ENABLED=true''',
+]
