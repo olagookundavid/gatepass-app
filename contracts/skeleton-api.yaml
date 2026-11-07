@@ -1,0 +1,25 @@
+name: skeleton-api
+service: skeleton
+kind: http-api
+image_binary: skeleton-api
+ports: {public: 8080, internal: null}
+base_path: /skeleton
+probes: {live: /livez, ready: /readyz, version: /version}
+graceful_shutdown_seconds: 30
+config_change_requires_restart: true
+env:
+  - {name: LOG_LEVEL, required: false, secret: false, source: static, example: "info", description: "debug|info|warn|error"}
+  - {name: HTTP_ADDR, required: false, secret: false, source: static, example: ":8080", description: "Public listener, default :8080"}
+  - {name: BASE_PATH, required: false, secret: false, source: static, example: "/skeleton", description: "Public route prefix, default /skeleton. The three routes are also served at the root, which is what the kubelet probes"}
+  - {name: SHUTDOWN_DELAY, required: false, secret: false, source: static, example: "5s", description: "Wait after SIGTERM before draining, default 5s"}
+  - {name: FORCE_NOT_READY, required: false, secret: false, source: static, example: "false", description: "true makes /readyz answer 503 {\"status\":\"not ready\"} (the pipeline's 'a broken image is not promoted' proof: set it in a values file in Git, no code change). /livez stays 200"}
+  - {name: OTEL_EXPORTER_OTLP_ENDPOINT, required: false, secret: false, source: static, example: "http://otel-collector.observability:4318", description: "OTLP/HTTP collector; telemetry is a no-op when unset"}
+  - {name: OTEL_SERVICE_NAME, required: false, secret: false, source: static, example: "skeleton-api", description: "Service name in traces/metrics"}
+  - {name: OTEL_RESOURCE_ATTRIBUTES, required: false, secret: false, source: static, example: "deployment.environment=dev", description: "Extra resource attributes"}
+iam: []
+calls_out: []
+queues: {consumes: [], produces: []}
+events: {publishes: [], consumes: []}
+database: {engine: none, auth: none, migrate_command: null}
+scaling_hint: {cpu_request: 50m, memory_request: 32Mi, hpa_metric: cpu, keda_queue: null}
+metrics: [http.server.request.duration]

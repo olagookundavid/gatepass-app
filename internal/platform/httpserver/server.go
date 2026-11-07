@@ -7,9 +7,12 @@ package httpserver
 //	otelhttp   starts the server span, extracts incoming `traceparent`, records
 //	           request count/duration metrics
 //	requestID  X-Request-Id: reuse the caller's (if sane) or generate one
-//	accessLog  one structured log line per request (method, path, status, ms)
+//	accessLog  one structured log line per request (method, path, status, ms):
+//	           info; debug for the probes /livez and /readyz; error for a 5xx
 //	recoverer  a panic becomes a 500 problem, not a dead connection
 //	bodyLimit  1 MiB cap: without it one client can make us buffer gigabytes
+//	routeTag   (innermost) copies the matched route pattern onto the span and the
+//	           request-duration metric as http.route
 //
 // AWS services touched: none.
 
@@ -18,11 +21,15 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"path"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/olagookundavid/gatepass-app/internal/platform/logging"
 	"github.com/olagookundavid/gatepass-app/internal/platform/problem"
@@ -54,6 +61,7 @@ func New(o Options) *http.Server {
 		root.Handle("/", o.Handler)
 	}
 	var h http.Handler = root
+	h = routeTag(h)
 	h = bodyLimit(h)
 	h = recoverer(h)
 	h = accessLog(h)
@@ -128,11 +136,19 @@ func accessLog(next http.Handler) http.Handler {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(sw, r)
-		// Probes are noisy: log them at debug.
+		// Probes are noisy: log them at debug, wherever they are mounted (root, or
+		// under BASE_PATH such as /skeleton/readyz). Every other 5xx is an error line,
+		// so "errors in the last 5 minutes" is a query on level=error. A failing probe
+		// stays at debug on purpose: a readiness 503 during shutdown or a forced
+		// not-ready would otherwise write an error line every probe period.
 		lvl := slog.LevelInfo
-		switch r.URL.Path {
-		case "/livez", "/readyz":
+		switch path.Base(r.URL.Path) {
+		case "livez", "readyz":
 			lvl = slog.LevelDebug
+		default:
+			if sw.status >= 500 {
+				lvl = slog.LevelError
+			}
 		}
 		slog.Log(r.Context(), lvl, "http request",
 			"method", r.Method, "path", r.URL.Path, "status", sw.status,
@@ -159,5 +175,30 @@ func bodyLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, MaxBodyBytes)
 		next.ServeHTTP(w, r)
+	})
+}
+
+// routeTag records the matched ServeMux pattern ("GET /catalog/v1/events/{id}"
+// becomes the route "/catalog/v1/events/{id}") as http.route. otelhttp would do
+// it itself, but it reads Request.Pattern from the request it passed down, and
+// requestID makes a copy (WithContext), so the pattern the mux sets would be lost
+// and every request-duration series would have no route: no per-endpoint RED.
+// Patterns are templates, so the label has low cardinality; an unmatched path
+// has no pattern and gets no route (never the raw URL).
+func routeTag(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r)
+		if r.Pattern == "" {
+			return
+		}
+		route := r.Pattern
+		if _, after, ok := strings.Cut(route, " "); ok {
+			route = after // drop the method
+		}
+		kv := attribute.String("http.route", route)
+		if l, ok := otelhttp.LabelerFromContext(r.Context()); ok {
+			l.Add(kv)
+		}
+		trace.SpanFromContext(r.Context()).SetAttributes(kv)
 	})
 }

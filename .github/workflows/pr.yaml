@@ -1,0 +1,99 @@
+# PULL REQUEST CHECKS for the Go repository. Nothing here can publish anything: the job has no
+# AWS access at all (checks that need none stay credential-free, so a malicious pull request
+# cannot reach a secret), and the image is built but never pushed.
+#
+# What each job stops:
+#   go            unformatted code, vet findings, lint findings (golangci-lint), failing unit tests,
+#                 a dependency or standard-library version with a KNOWN vulnerability that the code
+#                 actually calls (govulncheck: it reads call paths, so it is far less noisy than a
+#                 plain version scan)
+#   image         a Dockerfile smell (hadolint), an image that does not build, an image with
+#                 HIGH/CRITICAL fixed vulnerabilities (Trivy)
+#   gitleaks      a secret anywhere in the git history
+#
+# Every `uses:` is pinned to a full commit SHA (tags can be moved; a SHA cannot).
+# The three job names are the required status checks of the `protect-main` ruleset.
+name: pr
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: go
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: gofmt (must print nothing)
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "not formatted:"; echo "$out"; exit 1; fi
+      - name: go vet (with and without the integration tag)
+        run: |
+          go vet ./...
+          go vet -tags integration ./...
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.15.0
+      - name: Unit tests
+        run: go test -race -count=1 ./...
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+  image:
+    name: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: build/Dockerfile
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build the skeleton image (not pushed)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: build/Dockerfile
+          build-args: BINARY=skeleton-api
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: gatepass/skeleton-api:pr
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: gatepass/skeleton-api:pr
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+  secrets:
+    name: gitleaks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks (pinned, checksum verified)
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          curl -fsSL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum --check
+          tar -xzf gitleaks.tar.gz gitleaks
+      - name: Scan the whole git history
+        run: ./gitleaks git --no-banner --redact --verbose .

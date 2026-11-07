@@ -19,6 +19,7 @@ Everything the prompt asked for is built; nothing was cut. AWS behaviour is **un
 | `notifications-api` | done | unit tests; store verified on DynamoDB Local |
 | `notifications-worker` | done | unit tests; end-to-end test written (needs real SQS/S3/SES) |
 | `lambda-nightly-report` | done | unit tests; report query and window edge cases on local PostgreSQL 17 |
+| `skeleton-api` | done (2026-11-07) | unit tests (routes, `FORCE_NOT_READY`, `BASE_PATH`, span and log with the same `trace_id`, duration metric); image built for linux/amd64 and linux/arm64, both ran `--read-only` as `nonroot`; `/readyz` 200, 503 with `FORCE_NOT_READY=true`; SIGTERM drains and exits 0 |
 
 ### Commands run and results (final state)
 
@@ -278,6 +279,21 @@ Complete per-binary tables, generated from `contracts/*.yaml` (the contracts are
 | `REDIS_AUTH_FILE` | no | yes | `/var/run/secrets/redis/password` | Fallback AUTH password file |
 
 
+#### `skeleton-api`
+
+Walking-skeleton binary (no AWS, no database): every variable is optional.
+
+| Variable | Required | Secret | Example | Description |
+|---|---|---|---|---|
+| `LOG_LEVEL` | no | no | `info` | debug\|info\|warn\|error |
+| `HTTP_ADDR` | no | no | `:8080` | Public listener, default :8080 |
+| `BASE_PATH` | no | no | `/skeleton` | Public route prefix, default /skeleton. The three routes are also served at the root, which is what the kubelet probes |
+| `SHUTDOWN_DELAY` | no | no | `5s` | Wait after SIGTERM before draining, default 5s |
+| `FORCE_NOT_READY` | no | no | `false` | true makes /readyz answer 503 (the pipeline's "a broken image is not promoted" proof). /livez stays 200 |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | no | no | `http://otel-collector.observability:4318` | OTLP/HTTP collector; telemetry is a no-op when unset |
+| `OTEL_SERVICE_NAME` | no | no | `skeleton-api` | Service name in traces/metrics |
+| `OTEL_RESOURCE_ATTRIBUTES` | no | no | `deployment.environment=dev` | Extra resource attributes |
+
 <!-- END-S2 -->
 
 ## 3. IAM actions per service
@@ -368,6 +384,10 @@ The Scheduler execution role for the daily schedule needs `lambda:InvokeFunction
 | `s3:PutObject`, `s3:GetObject` | `arn:aws:s3:::<tickets-bucket>/tickets/*` | store the ticket; make the presigned link work |
 | `cognito-idp:AdminGetUser` | `arn:aws:cognito-idp:<region>:<account-id>:userpool/<pool-id>` | look up the address at send time |
 | `ses:SendEmail` | the identity ARN (`arn:aws:ses:<region>:<account-id>:identity/<address-or-domain>`) and the configuration set ARN | send mail (SES v2) |
+
+### skeleton-api
+
+None. No AWS client; the contract has `iam: []`.
 
 <!-- END-S3 -->
 
@@ -528,13 +548,18 @@ Summary of all rules: catalog `EventPublished` -> inventory queue; orders `Payme
 - sqsconsumer: every message now gets a log correlation context (`request_id` = SQS message id) so `user_id` can be attached by handlers.
 
 - platform: problem `type` values are URNs; `X-Request-Id` is only reused when it matches `[A-Za-z0-9._-]{8,64}` (otherwise a new UUID), so arbitrary client text never reaches logs or response headers.
-- platform: `BASE_PATH` prefixes only the public API; health routes are always at the root. The internal listener has no health routes (probes use the public port).
+- platform: `BASE_PATH` prefixes only the public API; health routes are always at the root (the skeleton additionally serves them under `BASE_PATH`, see above). The internal listener has no health routes (probes use the public port).
 - platform: readiness results are cached 5 s and failures are reported as `"fail"` without error text (hostnames could leak).
 - platform: `pgdb` has test-only constructors (`ConnectDSN`, `ConnectDSNWithCreds`) behind the `integration` build tag; no production binary contains them. The same tag guards `testenv.FreshSchema`.
 - reports: "sales of a day" = orders whose transition to `paid` happened in the UTC day (from `order_status_history`), with a column showing how many are still paid; a report for today is refused (`{"date":...}` must be a finished day).
 - A `.dockerignore` excludes docs, markdown and `.git` from the build context. `services/<service>/<binary>.env.example` files are generated from the contracts and contain placeholders only.
 - Git: local commits only, author = the machine's `git config` (user.name/user.email); no remote, no push, no trailers or AI attribution in messages.
 - The golden-path script needs `curl` and `jq`, reads `TOKEN`/`ADMIN_TOKEN` from the environment and never prints them. `WAIT_EXPIRY=true` additionally waits for a hold to expire.
+
+- skeleton: `cmd/skeleton-api` is the walking-skeleton binary for the delivery pipeline (request from the coach, `docs/GO_AGENT_REQUEST_skeleton-api.md`). It does **not** use `config.LoadCommon` or `bootstrap.Init`, because both require `AWS_REGION` and load an AWS config; it reads its five variables with `config.Loader` and wires the logger and telemetry itself. Nothing is required.
+- skeleton: the three routes are served **both** under `BASE_PATH` (what the Ingress routes, and what the request's check `curl localhost:8080/skeleton/readyz` uses) **and** at the root (what the kubelet probes, as for every other service). The platform `Health` is not used, because its bodies differ from the requested ones (`alive` / `not_ready` / a `checks` object versus `ok` / `not ready`); the skeleton has its own three handlers with the requested bodies. `/readyz` is also 503 while shutting down.
+- platform (changed for every service, found while doing the skeleton): (1) `httpserver` access log: a 5xx on a non-probe route is now logged at `error` (was `info`), and the probe exemption (debug) now matches `/livez` and `/readyz` under any prefix, so `/skeleton/readyz` is quiet too. A failing probe stays at debug on purpose (a forced not-ready or a shutdown would write an error line every probe period); the request said "any 5xx", flip it in `accessLog` if probes should count. (2) new innermost middleware `routeTag`: `http.route` was **missing** from `http.server.request.duration` and from spans for every service (the `requestID` middleware copies the request, so the pattern the mux sets never reached `otelhttp`); it is now set from the matched pattern, method stripped (`/catalog/v1/events/{id}`), low cardinality, none for unmatched paths. Without it Phase 5 could not show RED per endpoint.
+- skeleton: `OTEL_SERVICE_NAME` is documented as the service name, but `telemetry.Setup` applies the code-supplied name after the environment, so the code name wins when they differ. For the skeleton both are `skeleton-api`; not changed.
 
 <!-- END-S6 -->
 
