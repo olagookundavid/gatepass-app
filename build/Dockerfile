@@ -39,7 +39,9 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH \
 # and a non-root user (uid 65532). The RDS CA bundle is embedded in the binary.
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 COPY --from=build /out/app /app
-USER nonroot:nonroot
+# Numeric on purpose (hadolint DL3066): Kubernetes `runAsNonRoot` cannot verify a user
+# given by name, and a name may not resolve on the host. 65532 is distroless "nonroot".
+USER 65532:65532
 # The root filesystem is meant to be read-only at runtime (Kubernetes
 # readOnlyRootFilesystem); the app writes only to /tmp, which the Pod mounts as emptyDir.
 ENTRYPOINT ["/app"]
