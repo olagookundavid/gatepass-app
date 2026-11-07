@@ -1,0 +1,51 @@
+# RELEASE: runs on every merge to main that changes something that ends up in an image. It
+# calls the reusable build-image.yaml once per service in the matrix. Adding a service to dev
+# is one line in the matrix below (plus its apps/<service>/values.yaml in the gitops repository).
+#
+# Why a path filter: the gitops pull request this workflow opens is in ANOTHER repository, so it
+# cannot retrigger this one, but docs-only merges should not build images either.
+#
+# `id-token: write` is granted here because a called workflow can never have MORE permission
+# than its caller (the build needs the OIDC token for AWS and for cosign).
+#
+# Related: _build-image.yaml (the steps), pr.yaml (what had to pass before merging).
+name: release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cmd/**"
+      - "internal/**"
+      - "migrations/**"
+      - "build/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/release.yaml"
+      - ".github/workflows/_build-image.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  image:
+    name: image-${{ matrix.binary }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {binary: skeleton-api, service: skeleton}
+          # Phase 8 adds one line per service, for example:
+          # - {binary: catalog-api, service: catalog}
+    uses: ./.github/workflows/_build-image.yaml
+    with:
+      binary: ${{ matrix.binary }}
+      service: ${{ matrix.service }}
+    secrets:
+      GITOPS_APP_PRIVATE_KEY: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}

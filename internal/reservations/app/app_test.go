@@ -212,10 +212,10 @@ func newFx(capacity int) *fx {
 	f := &fx{store: newStore(), sched: &fakeSched{scheduled: map[string]time.Time{}}, lim: &fakeLimiter{allow: true}}
 	now := base
 	f.now = &now
-	n := 0
+	var n atomic.Int64 // NewID is called by many goroutines in the concurrency test
 	f.svc = New(Service{Store: f.store, Scheduler: f.sched, Limiter: limiterFunc(func() (bool, error) { return f.lim.allow, f.lim.err }),
 		Now:   func() time.Time { return *f.now },
-		NewID: func() string { n++; return fmt.Sprintf("00000000-0000-7000-8000-%012d", n) }})
+		NewID: func() string { return fmt.Sprintf("00000000-0000-7000-8000-%012d", n.Add(1)) }})
 	f.store.inv[ik("ev", "tt")] = domain.Inventory{EventID: "ev", TicketTypeID: "tt", Capacity: capacity, Available: capacity, PriceCents: 1500, Currency: "USD"}
 	return f
 }

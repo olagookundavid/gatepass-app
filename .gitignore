@@ -5,6 +5,19 @@
 *.out
 coverage.*
 
+# Stray binaries from `go build ./cmd/<name>` without -o (use `make build`, which writes to /bin/).
+# One line per binary on purpose: /cmd/*/* would also hide source files.
+/cmd/catalog-api/catalog-api
+/cmd/lambda-hold-expirer/lambda-hold-expirer
+/cmd/lambda-nightly-report/lambda-nightly-report
+/cmd/notifications-api/notifications-api
+/cmd/notifications-worker/notifications-worker
+/cmd/orders-api/orders-api
+/cmd/orders-outbox-relay/orders-outbox-relay
+/cmd/orders-worker/orders-worker
+/cmd/reservations-api/reservations-api
+/cmd/skeleton-api/skeleton-api
+
 # Local env files (only .env.example is committed)
 .env
 .env.*

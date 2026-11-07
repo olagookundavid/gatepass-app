@@ -8,7 +8,7 @@ BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 PKG := github.com/olagookundavid/gatepass-app/internal/platform/buildinfo
 LDFLAGS := -s -w -X $(PKG).Version=$(VERSION) -X $(PKG).BuildTime=$(BUILD_TIME)
 
-SERVICES := catalog-api reservations-api orders-api orders-worker orders-outbox-relay notifications-api notifications-worker
+SERVICES := catalog-api reservations-api orders-api orders-worker orders-outbox-relay notifications-api notifications-worker skeleton-api
 LAMBDAS := lambda-hold-expirer lambda-nightly-report
 
 .PHONY: build test test-integration lint image lambda-zip openapi-check tidy \
