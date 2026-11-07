@@ -502,7 +502,7 @@ Summary of all rules: catalog `EventPublished` -> inventory queue; orders `Payme
 - Module path `github.com/olagookundavid/gatepass-app`, `go 1.26`, `toolchain go1.26.5`.
 - Problem `type` values are URNs (`urn:gatepass:problem:<code>`); no public docs site exists to dereference.
 - Hexagonal packages: `internal/<service>/{domain,ports,app,adapters/...}`.
-- Base images pinned by digest in `build/Dockerfile` (`golang:1.26` index digest, `distroless/static-debian12:nonroot`). The `golang:1.26` image currently ships go 1.26.10; `go.mod` says `toolchain go1.26.5`, a lower version, so no toolchain download happens.
+- Base images pinned by digest in `build/Dockerfile` (`golang:1.26` index digest, `distroless/static-debian12:nonroot`). The pinned `golang:1.26` digest ships go 1.26.10 (refreshed 2026-11-07 to `sha256:cfa27959...`, same Go version); `go.mod` says `toolchain go1.26.10` (raised from go1.26.5 after `govulncheck` reported ten standard-library vulnerabilities fixed in 1.26.9/1.26.10), so no toolchain download happens in the image build. CI uses the `go.mod` toolchain (`go-version-file`), which is why that line, not the image digest, was the vulnerable one. `golang.org/x/net` (indirect, pulled in by `google.golang.org/grpc` through the OTLP metric exporter) is v0.62.0, fixing CVE-2026-78661 in `x/net/html`.
 - `.dockerignore` excludes `*.md`, `docs`, `.git`.
 - Git commit author/email are whatever the machine's `git config` has (not changed by the agent).
 - The RDS CA bundle (`internal/platform/pgdb/certs/global-bundle.pem`) was downloaded from `https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem` on the authoring day and embedded; refresh it when AWS rotates CAs, or override with `DB_SSL_ROOT_CERT`.

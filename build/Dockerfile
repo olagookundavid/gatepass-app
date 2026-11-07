@@ -11,10 +11,12 @@
 # Base images are pinned by digest (the digest of the multi-arch index, so the
 # same line works for amd64 and arm64). Update them deliberately, not by accident:
 #   docker buildx imagetools inspect golang:1.26
+# Current digest = Go 1.26.10 (check: docker run --rm golang:1.26@sha256:<digest> go version). Keep it
+# equal to or newer than `toolchain` in go.mod; govulncheck in CI fails on a vulnerable standard library.
 #
 # Lambda binaries are NOT built here; see `make lambda-zip`.
 
-FROM --platform=$BUILDPLATFORM golang:1.26@sha256:670bb5aa5349ae03b8516764718486f4f16399134bdc9acd0c46a23f043ab05c AS build
+FROM --platform=$BUILDPLATFORM golang:1.26@sha256:cfa27959837144bf4649802ba38e59daffd0dd2a7994aa83daaf113285b0f551 AS build
 ARG BINARY
 ARG TARGETARCH
 ARG VERSION=dev
