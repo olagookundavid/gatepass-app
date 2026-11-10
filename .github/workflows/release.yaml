@@ -43,8 +43,15 @@ jobs:
           - {binary: skeleton-api, service: skeleton}
           - {binary: catalog-api, service: catalog}
           # One image, two applications: `service` lists them (space separated) and one pull request
-          # pins both. The other services are added the same way in walkthrough 11.
+          # pins both.
           - {binary: reservations-api, service: "reservations reservations-consumer"}
+          # Walkthrough 11: orders and notifications. Here every binary is its own image and its own
+          # application (orders-api, orders-worker and orders-outbox-relay scale and fail apart).
+          - {binary: orders-api, service: orders}
+          - {binary: orders-worker, service: orders-worker}
+          - {binary: orders-outbox-relay, service: orders-outbox-relay}
+          - {binary: notifications-api, service: notifications}
+          - {binary: notifications-worker, service: notifications-worker}
     uses: ./.github/workflows/_build-image.yaml
     with:
       binary: ${{ matrix.binary }}
