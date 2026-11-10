@@ -30,7 +30,7 @@ on:
         required: true
         type: string
       service:
-        description: "Directory under apps/ in the gitops repository (e.g. skeleton)"
+        description: "Directory under apps/ in the gitops repository (e.g. skeleton); several applications that run the same image are separated by spaces (e.g. \"reservations reservations-consumer\")"
         required: true
         type: string
     secrets:
@@ -158,11 +158,16 @@ jobs:
         run: |
           set -euo pipefail
           cd gitops
-          branch="bump/${SERVICE}-${TAG}"
+          # SERVICE may name several applications that run the same image (reservations: the API and
+          # its consumer), separated by spaces: every one gets the same pin in the SAME pull request,
+          # so they can never run different digests of one release.
+          branch="bump/${SERVICE// /-}-${TAG}"
           git config user.name "gatepass-release-bot"
           git config user.email "gatepass-release-bot@users.noreply.github.com"
-          mkdir -p "apps/${SERVICE}"
-          cat > "apps/${SERVICE}/dev.yaml" <<YAML
+          changed=0
+          for svc in $SERVICE; do
+            mkdir -p "apps/${svc}"
+            cat > "apps/${svc}/dev.yaml" <<YAML
           # WRITTEN BY THE RELEASE WORKFLOW of gatepass-app. Do not edit by hand.
           # The image deployed in dev: the tag is a label (the commit), the digest decides the bytes.
           # To roll back, revert the pull request that changed this file.
@@ -170,14 +175,14 @@ jobs:
             tag: ${TAG}
             digest: ${DIGEST}
           YAML
-          if git diff --quiet -- "apps/${SERVICE}/dev.yaml" && [ -z "$(git ls-files --others --exclude-standard apps/${SERVICE}/dev.yaml)" ]; then
-            echo "already pinned, nothing to do"; exit 0
-          fi
+            if ! git diff --quiet -- "apps/${svc}/dev.yaml" || [ -n "$(git ls-files --others --exclude-standard "apps/${svc}/dev.yaml")" ]; then changed=1; fi
+          done
+          if [ "$changed" = 0 ]; then echo "already pinned, nothing to do"; exit 0; fi
           git switch -c "$branch"
-          git add "apps/${SERVICE}/dev.yaml"
-          git commit -m "Deploy ${SERVICE} ${TAG} to dev"
+          for svc in $SERVICE; do git add "apps/${svc}/dev.yaml"; done
+          git commit -m "Deploy ${SERVICE// / and } ${TAG} to dev"
           git push -u origin "$branch"
           gh pr create --repo "$GITHUB_REPOSITORY_OWNER/gatepass-gitops" --head "$branch" \
-            --title "Deploy ${SERVICE} ${TAG} to dev" \
+            --title "Deploy ${SERVICE// / and } ${TAG} to dev" \
             --body "Image \`${DIGEST}\` built from ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${SOURCE_SHA}. Signed with cosign (keyless); SBOM attached. Merging deploys it to dev; reverting this pull request rolls it back."
           gh pr merge "$branch" --repo "$GITHUB_REPOSITORY_OWNER/gatepass-gitops" --auto --squash
