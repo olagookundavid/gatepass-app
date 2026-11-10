@@ -41,8 +41,10 @@ jobs:
       matrix:
         include:
           - {binary: skeleton-api, service: skeleton}
-          # Phase 8 adds one line per service, for example:
-          # - {binary: catalog-api, service: catalog}
+          - {binary: catalog-api, service: catalog}
+          # One image, two applications: `service` lists them (space separated) and one pull request
+          # pins both. The other services are added the same way in walkthrough 11.
+          - {binary: reservations-api, service: "reservations reservations-consumer"}
     uses: ./.github/workflows/_build-image.yaml
     with:
       binary: ${{ matrix.binary }}
