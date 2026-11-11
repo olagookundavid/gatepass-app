@@ -9,6 +9,7 @@
 # than its caller (the build needs the OIDC token for AWS and for cosign).
 #
 # Related: _build-image.yaml (the steps), pr.yaml (what had to pass before merging).
+# (2026-11-11: this line was added only to produce a new commit and image tag for the canary test of walkthrough 12.)
 name: release
 
 on:
